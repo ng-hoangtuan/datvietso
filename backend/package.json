@@ -4,6 +4,11 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "migrate": "node migrate.js",
+    "migrate:fresh": "node migrate.js --fresh --seed",
+    "seed": "node migrate.js --seed",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

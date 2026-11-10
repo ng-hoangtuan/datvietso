@@ -107,7 +107,7 @@ import VerticalNavLink from '@layouts/components/VerticalNavLink.vue'
     }"
   /> -->
   <VerticalNavLink :item="{
-    title: 'Chat',
+    title: 'Chat Trò chuyện',
     icon: 'ri-wechat-line',
     to: '/chat',
   }" />
@@ -123,8 +123,8 @@ import VerticalNavLink from '@layouts/components/VerticalNavLink.vue'
   }" />
 
   <VerticalNavLink :item="{
-    title: 'Assets',
-    icon: 'ri-user-settings-line',
+    title: 'Quản lý Tài sản',
+    icon: 'ri-archive-line',
     to: '/assets',
   }" />
 

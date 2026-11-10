@@ -7,6 +7,7 @@ export {}
 /* prettier-ignore */
 declare module 'vue' {
   export interface GlobalComponents {
+    AssetAllocationModal: typeof import('./src/components/assets/AssetAllocationModal.vue')['default']
     AssetAuditCard: typeof import('./src/components/assets/AssetAuditCard.vue')['default']
     AssetDetailModal: typeof import('./src/components/assets/AssetDetailModal.vue')['default']
     AssetFilterBar: typeof import('./src/components/assets/AssetFilterBar.vue')['default']
@@ -15,6 +16,10 @@ declare module 'vue' {
     CardStatisticsHorizontal: typeof import('./src/@core/components/cards/CardStatisticsHorizontal.vue')['default']
     CardStatisticsVertical: typeof import('./src/@core/components/cards/CardStatisticsVertical.vue')['default']
     CardStatisticsWithImages: typeof import('./src/@core/components/cards/CardStatisticsWithImages.vue')['default']
+    ChatGroupModal: typeof import('./src/components/chat/ChatGroupModal.vue')['default']
+    ChatLog: typeof import('./src/components/chat/ChatLog.vue')['default']
+    ChatSidebar: typeof import('./src/components/chat/ChatSidebar.vue')['default']
+    ChatUserProfileRight: typeof import('./src/components/chat/ChatUserProfileRight.vue')['default']
     ErrorHeader: typeof import('./src/components/ErrorHeader.vue')['default']
     MoreBtn: typeof import('./src/@core/components/MoreBtn.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']

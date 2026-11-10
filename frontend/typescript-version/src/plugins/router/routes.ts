@@ -8,10 +8,10 @@ export const routes = [
         path: 'dashboard',
         component: () => import('@/pages/dashboard.vue'),
       },
-      // {
-      //   path: 'account-settings',
-      //   component: () => import('@/pages/account-settings.vue'),
-      // },
+      {
+        path: 'account-settings',
+        component: () => import('@/pages/account-settings.vue'),
+      },
       // {
       //   path: 'typography',
       //   component: () => import('@/pages/typography.vue'),
@@ -42,7 +42,7 @@ export const routes = [
       },
       {
         path: 'calendar',
-        component: () => import('@/pages/kanban.vue'),
+        component: () => import('@/pages/calendar.vue'),
       },
       {
         path: 'assets',
