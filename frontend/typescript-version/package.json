@@ -2,6 +2,9 @@
   "name": "materio-vuetify-vuejs-admin-template-free",
   "version": "2.3.0",
   "private": true,
+  "engines": {
+    "node": ">=18"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
