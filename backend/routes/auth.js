@@ -1,9 +1,45 @@
 const express = require('express');
+const { ObjectId } = require('mongodb');
+const { blockInDemo } = require('../middleware/auth');
 
-module.exports = function(pool) {
+/**
+ * Xác thực trên MongoDB.
+ *
+ * Bản MySQL phải JOIN 4 bảng (users -> employees -> departments -> positions)
+ * cho mỗi lần đăng nhập. Sau khi gộp users+employees và denormalize snapshot
+ * phòng ban / chức vụ, tất cả còn MỘT findOne.
+ *
+ * CẢNH BÁO BẢO MẬT — giữ nguyên hành vi của bản cũ, KHÔNG phải thiết kế đúng:
+ *   1. Mật khẩu '123456' mở được MỌI tài khoản, bỏ qua hoàn toàn passwordHash.
+ *   2. So mật khẩu dạng plaintext, không dùng bcrypt.compare.
+ *   3. Token `dvs_token_<id>_<timestamp>` không có chữ ký; /me chỉ tách chuỗi
+ *      lấy id nên sửa token là đăng nhập thành người khác.
+ * Ba điểm này được giữ y nguyên vì frontend đang đăng nhập bằng mật khẩu mặc
+ * định 123456 — sửa sẽ làm hỏng app. Xem MONGODB.md để biết cách khắc phục.
+ */
+module.exports = function (db) {
     const router = express.Router();
+    const users = db.collection('users');
 
-    // 1. POST /api/auth/login - Đăng nhập bằng employee_code và mật khẩu (mặc định 123456)
+    /** Dựng profile trả về cho client, giữ đúng hình dạng cũ. */
+    const toProfile = (u, fallbackCode) => ({
+        id: u._id.toString(),
+        employee_id: u.employee ? u._id.toString() : null,
+        employee_code: (u.employee && u.employee.employeeCode) || fallbackCode,
+        username: u.username,
+        full_name: u.fullName,
+        email: u.email,
+        phone: u.phone,
+        avatar: u.avatar
+            || `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(u.fullName)}`,
+        role: u.role,
+        department: (u.employee && u.employee.department && u.employee.department.name)
+            || 'Phòng Kỹ Thuật',
+        position: (u.employee && u.employee.position && u.employee.position.title)
+            || 'Nhân sự',
+    });
+
+    // 1. POST /api/auth/login - Đăng nhập bằng employee_code và mật khẩu
     router.post('/login', async (req, res) => {
         try {
             const { employee_code, password } = req.body;
@@ -11,89 +47,57 @@ module.exports = function(pool) {
             if (!employee_code || !employee_code.trim()) {
                 return res.status(400).json({ error: 'Vui lòng nhập Mã nhân sự (Employee Code)!' });
             }
-
             if (!password) {
                 return res.status(400).json({ error: 'Vui lòng nhập Mật khẩu!' });
             }
 
             const cleanCode = employee_code.trim();
 
-            // Truy vấn thông tin user kèm nhân sự, phòng ban, chức vụ
-            const [rows] = await pool.query(`
-                SELECT 
-                    u.id, 
-                    u.username, 
-                    u.email, 
-                    u.password_hash, 
-                    u.full_name, 
-                    u.phone, 
-                    u.avatar, 
-                    u.role, 
-                    u.status,
-                    e.id as employee_id,
-                    e.employee_code,
-                    e.gender,
-                    e.join_date,
-                    d.name as department_name,
-                    p.title as position_title
-                FROM users u
-                LEFT JOIN employees e ON u.id = e.user_id
-                LEFT JOIN departments d ON e.department_id = d.id
-                LEFT JOIN positions p ON e.position_id = p.id
-                WHERE e.employee_code = ? OR u.username = ? OR u.email = ?
-                LIMIT 1
-            `, [cleanCode, cleanCode, cleanCode]);
+            // MỘT query thay cho câu JOIN 4 bảng. Index:
+            //   uq_users_employee_code / uq_users_username / uq_users_email
+            const user = await users.findOne({
+                $or: [
+                    { 'employee.employeeCode': cleanCode },
+                    { username: cleanCode },
+                    { email: cleanCode },
+                ],
+            });
 
-            if (rows.length === 0) {
-                return res.status(401).json({ 
-                    error: `Không tìm thấy tài khoản với mã nhân sự "${cleanCode}"!` 
+            if (!user) {
+                return res.status(401).json({
+                    error: `Không tìm thấy tài khoản với mã nhân sự "${cleanCode}"!`,
                 });
             }
 
-            const user = rows[0];
-
-            // Kiểm tra trạng thái tài khoản
             if (user.status !== 'ACTIVE') {
-                return res.status(403).json({ 
-                    error: 'Tài khoản này đang bị khóa hoặc ngưng hoạt động. Vui lòng liên hệ IT/HR!' 
+                return res.status(403).json({
+                    error: 'Tài khoản này đang bị khóa hoặc ngưng hoạt động. Vui lòng liên hệ IT/HR!',
                 });
             }
 
-            // Kiểm tra mật khẩu (Hỗ trợ mật khẩu mặc định 123456 hoặc khớp password_hash)
+            // Giữ nguyên logic cũ — xem cảnh báo bảo mật ở đầu file
             const isDefaultPass = password === '123456';
-            const isMatchHash = user.password_hash === password || user.password_hash === '$2a$10$abcdefghijklmnopqrstuv';
+            const isMatchHash = user.passwordHash === password
+                || user.passwordHash === '$2a$10$abcdefghijklmnopqrstuv';
 
             if (!isDefaultPass && !isMatchHash) {
-                return res.status(401).json({ 
-                    error: 'Mật khẩu không chính xác! (Mật khẩu mặc định là: 123456)' 
+                return res.status(401).json({
+                    error: 'Mật khẩu không chính xác! (Mật khẩu mặc định là: 123456)',
                 });
             }
 
-            // Cập nhật thời gian đăng nhập gần nhất
-            await pool.query('UPDATE users SET last_login_at = NOW() WHERE id = ?', [user.id]);
+            await users.updateOne(
+                { _id: user._id },
+                { $set: { lastLoginAt: new Date(), updatedAt: new Date() } },
+            );
 
-            // Sinh token phiên đăng nhập đơn giản
-            const token = `dvs_token_${user.id}_${Date.now()}`;
-
-            const userProfile = {
-                id: user.id.toString(),
-                employee_id: user.employee_id ? user.employee_id.toString() : null,
-                employee_code: user.employee_code || cleanCode,
-                username: user.username,
-                full_name: user.full_name,
-                email: user.email,
-                phone: user.phone,
-                avatar: user.avatar || `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(user.full_name)}`,
-                role: user.role,
-                department: user.department_name || 'Phòng Kỹ Thuật',
-                position: user.position_title || 'Nhân sự'
-            };
+            const token = `dvs_token_${user._id.toString()}_${Date.now()}`;
 
             res.json({
                 success: true,
                 message: 'Đăng nhập thành công!',
                 token,
-                user: userProfile
+                user: toProfile(user, cleanCode),
             });
         } catch (err) {
             console.error('Login error:', err);
@@ -107,36 +111,30 @@ module.exports = function(pool) {
             const authHeader = req.headers.authorization;
             if (!authHeader) return res.status(401).json({ error: 'Chưa đăng nhập' });
 
+            // Token dạng dvs_token_<objectId>_<timestamp>. ObjectId không chứa '_'
+            // nên tách theo '_' vẫn đúng như bản cũ.
             const token = authHeader.replace('Bearer ', '');
             const parts = token.split('_');
             const userId = parts[2];
 
-            if (!userId) return res.status(401).json({ error: 'Token không hợp lệ' });
+            if (!userId || !ObjectId.isValid(userId)) {
+                return res.status(401).json({ error: 'Token không hợp lệ' });
+            }
 
-            const [rows] = await pool.query(`
-                SELECT 
-                    u.id, u.username, u.email, u.full_name, u.phone, u.avatar, u.role, u.status,
-                    e.employee_code, d.name as department_name, p.title as position_title
-                FROM users u
-                LEFT JOIN employees e ON u.id = e.user_id
-                LEFT JOIN departments d ON e.department_id = d.id
-                LEFT JOIN positions p ON e.position_id = p.id
-                WHERE u.id = ?
-            `, [userId]);
+            const u = await users.findOne({ _id: new ObjectId(userId) });
+            if (!u) return res.status(404).json({ error: 'Không tìm thấy người dùng' });
 
-            if (rows.length === 0) return res.status(404).json({ error: 'Không tìm thấy người dùng' });
-
-            const u = rows[0];
             res.json({
-                id: u.id.toString(),
-                employee_code: u.employee_code,
+                id: u._id.toString(),
+                employee_code: u.employee ? u.employee.employeeCode : null,
                 username: u.username,
-                full_name: u.full_name,
+                full_name: u.fullName,
                 email: u.email,
-                avatar: u.avatar || `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(u.full_name)}`,
+                avatar: u.avatar
+                    || `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(u.fullName)}`,
                 role: u.role,
-                department: u.department_name,
-                position: u.position_title
+                department: u.employee && u.employee.department ? u.employee.department.name : null,
+                position: u.employee && u.employee.position ? u.employee.position.title : null,
             });
         } catch (err) {
             console.error('Auth me error:', err);
@@ -145,29 +143,27 @@ module.exports = function(pool) {
     });
 
     // 3. GET /api/auth/demo-accounts - Danh sách tài khoản mẫu để test nhanh
-    router.get('/demo-accounts', async (req, res) => {
+    //
+    // Endpoint này trả về cả `defaultPassword` và KHÔNG đòi đăng nhập. Trong
+    // mạng nội bộ thì tiện; mở ra Internet thì đúng nghĩa treo bảng mật khẩu
+    // trước cửa. DEMO_MODE=true sẽ tắt nó, và 4 nút đăng nhập nhanh ở trang
+    // login tự biến mất theo.
+    router.get('/demo-accounts', blockInDemo('Đã tắt trong bản dùng thử'), async (req, res) => {
         try {
-            const [rows] = await pool.query(`
-                SELECT 
-                    u.id, u.full_name, u.role, u.avatar,
-                    e.employee_code, d.name as department_name, p.title as position_title
-                FROM users u
-                JOIN employees e ON u.id = e.user_id
-                LEFT JOIN departments d ON e.department_id = d.id
-                LEFT JOIN positions p ON e.position_id = p.id
-                WHERE u.status = 'ACTIVE'
-                ORDER BY e.employee_code ASC
-                LIMIT 6
-            `);
+            const rows = await users
+                .find({ status: 'ACTIVE', employee: { $ne: null } })
+                .sort({ 'employee.employeeCode': 1 })
+                .limit(6)
+                .toArray();
 
-            res.json(rows.map(r => ({
-                id: r.id.toString(),
-                code: r.employee_code,
-                name: r.full_name,
+            res.json(rows.map((r) => ({
+                id: r._id.toString(),
+                code: r.employee.employeeCode,
+                name: r.fullName,
                 role: r.role,
-                department: r.department_name,
-                position: r.position_title,
-                defaultPassword: '123456'
+                department: r.employee.department ? r.employee.department.name : null,
+                position: r.employee.position ? r.employee.position.title : null,
+                defaultPassword: '123456',
             })));
         } catch (err) {
             res.status(500).json({ error: err.message });
@@ -176,4 +172,3 @@ module.exports = function(pool) {
 
     return router;
 };
-

@@ -1,9 +1,33 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { io, Socket } from 'socket.io-client'
+import { API_BASE, socketUrl } from '@/utils/api'
+import { vnIncludes } from '@/utils/vnSearch'
 
 export type GroupRole = 'owner' | 'admin' | 'member'
-export type MessageType = 'text' | 'media' | 'location'
+
+/**
+ * `file` và `system` khớp enum `messages.type` trong MongoDB (xem backend/db/schema.js):
+ *   - `media`  ảnh / video / tệp đính kèm gửi qua /api/upload
+ *   - `location` toạ độ GPS (Task 3.1)
+ *   - `system` tin do server sinh: tạo nhóm, thêm/xóa thành viên, đổi vai trò,
+ *     đổi tên nhóm. Render giữa khung chat, không phải bong bóng của ai.
+ */
+export type MessageType = 'text' | 'media' | 'location' | 'file' | 'system'
+
+/** Loại đính kèm server tính sẵn lúc ghi, dùng cho panel Bộ sưu tập (Task 3.2). */
+export type AttachmentKind = 'image' | 'video' | 'file' | 'link'
+
+export type ReactionType = 'like' | 'love' | 'haha' | 'wow' | 'sad' | 'angry'
+
+export const REACTION_EMOJI: Record<ReactionType, string> = {
+  like: '👍',
+  love: '❤️',
+  haha: '😂',
+  wow: '😮',
+  sad: '😢',
+  angry: '😡',
+}
 
 export interface ChatUser {
   userId: string
@@ -24,7 +48,12 @@ export interface MessageMetadata {
   lat?: number
   lng?: number
   address?: string
-  mentions?: string[]
+}
+
+export interface MessageReaction {
+  userId: string
+  reaction: ReactionType
+  createdAt?: string
 }
 
 export interface ChatMessage {
@@ -36,10 +65,18 @@ export interface ChatMessage {
   type: MessageType
   content: string
   metadata?: MessageMetadata
+  /** userId của những người bị @ — server tự parse, client không gửi lên. */
+  mentions?: string[]
+  attachmentKind?: AttachmentKind | null
+  reactions?: MessageReaction[]
   isDeleted?: boolean
+  isSystem?: boolean
   createdAt?: string
   time: string
   isMe: boolean
+  /** Tin đang chờ server xác nhận (optimistic UI), hoặc gửi lỗi. */
+  pending?: boolean
+  failed?: boolean
 }
 
 export interface ChatRoom {
@@ -50,18 +87,53 @@ export interface ChatRoom {
   isGroup: boolean
   isPinned: boolean
   myRole?: GroupRole
+  partnerId?: string | null
+  createdBy?: string | null
   members: ChatUser[]
   lastMessage?: {
     id?: any
     content: string
     type: MessageType
+    senderId?: string
+    senderName?: string
     time: string
+    createdAt?: string
   } | null
   unreadCount: number
+  /** Số tin có @tôi chưa đọc — badge riêng trên sidebar (Task 4.1). */
+  mentionCount: number
+  lastReadAt?: string | null
   updatedAt?: string
 }
 
-const API_CHAT = 'http://localhost:5000/api/chat'
+export interface AttachmentItem {
+  id: string
+  kind: AttachmentKind
+  type: MessageType
+  content: string
+  metadata: MessageMetadata
+  senderId: string
+  senderName: string
+  createdAt: string
+  time: string
+}
+
+export interface MentionAlert {
+  conversationId: string
+  messageId: string
+  conversationName: string | null
+  isGroup: boolean
+  senderId: string
+  senderName: string
+  senderAvatar?: string
+  content: string
+  createdAt: string
+}
+
+const API_CHAT = `${API_BASE}/api/chat`
+
+/** Số tin tải mỗi lần. Backend chặn tối đa 200. */
+const PAGE_SIZE = 50
 
 export const useChatStore = defineStore('chat', () => {
   // Lấy user đã đăng nhập từ localStorage / sessionStorage
@@ -70,6 +142,7 @@ export const useChatStore = defineStore('chat', () => {
       const saved = localStorage.getItem('dvs_user') || sessionStorage.getItem('dvs_user')
       if (saved) {
         const u = JSON.parse(saved)
+
         return {
           userId: String(u.id),
           name: u.full_name || u.name,
@@ -80,70 +153,39 @@ export const useChatStore = defineStore('chat', () => {
           position: u.position,
         }
       }
-    } catch (e) {}
-    return {
-      userId: '1',
-      name: 'Nguyễn Quản Trị',
-      avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=Admin',
-      email: 'admin@datvietso.vn',
-      employeeCode: 'DVS-001',
     }
+    catch (e) { /* localStorage có thể bị chặn */ }
+
+    return { userId: '', name: 'Khách', avatar: '' }
   }
 
   // Current user đăng nhập (tự động nạp theo tài khoản đã đăng nhập)
   const currentUser = ref<ChatUser>(getStoredUser())
 
-  // Danh bạ nhân sự trong hệ thống (tất cả nhân viên để tìm kiếm và nhắn tin 1-1)
-  const contactList = ref<ChatUser[]>([
-    {
-      userId: '1',
-      name: 'Nguyễn Quản Trị',
-      avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=Admin',
-      email: 'admin@datvietso.vn',
-      employeeCode: 'DVS-001',
-      department: 'Ban Giám Đốc',
-      position: 'Tổng Giám Đốc',
-    },
-    {
-      userId: '2',
-      name: 'Trần Anh Tuấn',
-      avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=Tuan',
-      email: 'tuan.ta@datvietso.vn',
-      employeeCode: 'DVS-002',
-      department: 'Khối Kỹ Thuật & Công Nghệ',
-      position: 'Kỹ Sư Phần Mềm Cao Cấp',
-    },
-    {
-      userId: '3',
-      name: 'Lê Thị Mai Hoa',
-      avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=Hoa',
-      email: 'hoa.ltm@datvietso.vn',
-      employeeCode: 'DVS-003',
-      department: 'Phòng Phát Triển Kinh Doanh',
-      position: 'Chuyên Viên Kinh Doanh',
-    },
-    {
-      userId: '4',
-      name: 'Phạm Ngọc Lan',
-      avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=Lan',
-      email: 'lan.pn@datvietso.vn',
-      employeeCode: 'DVS-004',
-      department: 'Phòng Nhân Sự & Hành Chính',
-      position: 'Trưởng Phòng Nhân Sự',
-    },
-  ])
+  /**
+   * Danh bạ nhân sự — nạp từ GET /api/chat/contacts.
+   *
+   * Bản cũ nhồi sẵn 4 nhân sự giả với userId '1'..'4'. Những id đó không phải
+   * ObjectId nên mọi thao tác thật (mở chat 1-1, tạo nhóm) đều bị backend trả 400,
+   * mà UI thì trông như đang hoạt động. Để rỗng và báo lỗi kết nối thì đúng hơn.
+   */
+  const contactList = ref<ChatUser[]>([])
 
   // Danh sách cuộc trò chuyện
   const chatRooms = ref<ChatRoom[]>([])
 
-  // Phòng chat đang chọn
-  const activeRoomId = ref<string | number>(1)
+  // Phòng chat đang chọn ('' = chưa chọn / chưa có phòng nào)
+  const activeRoomId = ref<string | number>('')
 
   // Tin nhắn theo conversationId: { [convId]: ChatMessage[] }
   const messagesMap = ref<Record<string | number, ChatMessage[]>>({})
 
+  /** Còn tin cũ hơn để tải tiếp không, theo từng phòng (phân trang). */
+  const hasMoreMap = ref<Record<string, boolean>>({})
+  const loadingOlder = ref(false)
+
   // Set các userId đang Online
-  const onlineUsers = ref<Set<string>>(new Set(['1', '2', '3']))
+  const onlineUsers = ref<Set<string>>(new Set())
 
   // Typing state
   const typingMap = ref<Record<string | number, string[]>>({})
@@ -154,59 +196,80 @@ export const useChatStore = defineStore('chat', () => {
   // Right Drawer Profile/Group Info state
   const isProfileRightOpen = ref(false)
 
+  /** Bộ sưu tập ảnh / video / file / link của phòng đang mở (Task 3.2). */
+  const attachments = ref<AttachmentItem[]>([])
+  const attachmentCounts = ref<Record<AttachmentKind, number>>({ image: 0, video: 0, file: 0, link: 0 })
+  const loadingAttachments = ref(false)
+
+  /** Lỗi gần nhất để UI hiện snackbar, thay cho console.warn im lặng. */
+  const lastError = ref('')
+
+  /** Thông báo @ gần nhất, cho popup/âm thanh (Task 4.1). */
+  const lastMention = ref<MentionAlert | null>(null)
+
   // Socket instance
   let socket: Socket | null = null
   const isConnected = ref(false)
 
-  // Active room computed
-  const activeRoom = computed(() => {
-    return chatRooms.value.find(r => r.id === activeRoomId.value) || chatRooms.value[0] || {
-      id: 1,
-      type: 'group',
-      name: 'Đất Việt Số - Tổng Công Ty',
-      avatar: 'https://api.dicebear.com/7.x/identicon/svg?seed=DatVietSo',
-      isGroup: true,
-      isPinned: false,
-      myRole: 'owner',
-      members: contactList.value,
-      unreadCount: 0,
-    }
-  })
+  /** Phòng rỗng khi chưa chọn gì — để template không phải kiểm tra null khắp nơi. */
+  const EMPTY_ROOM: ChatRoom = {
+    id: '',
+    type: 'group',
+    name: 'Chưa có cuộc trò chuyện',
+    avatar: '',
+    isGroup: false,
+    isPinned: false,
+    members: [],
+    lastMessage: null,
+    unreadCount: 0,
+    mentionCount: 0,
+  }
 
-  // Active messages computed
-  const activeMessages = computed(() => {
-    return messagesMap.value[activeRoomId.value] || []
-  })
+  const activeRoom = computed<ChatRoom>(() =>
+    chatRooms.value.find(r => String(r.id) === String(activeRoomId.value)) || EMPTY_ROOM)
+
+  /** Có phòng thật đang mở hay không — dùng để bật/tắt ô nhập tin. */
+  const hasActiveRoom = computed(() => !!activeRoom.value.id)
+
+  const activeMessages = computed(() => messagesMap.value[activeRoomId.value] || [])
+
+  const hasMoreMessages = computed(() => !!hasMoreMap.value[String(activeRoomId.value)])
+
+  /** Tổng số tin chưa đọc, cho badge trên menu/tab. */
+  const totalUnread = computed(() => chatRooms.value.reduce((n, r) => n + (r.unreadCount || 0), 0))
+  const totalMentions = computed(() => chatRooms.value.reduce((n, r) => n + (r.mentionCount || 0), 0))
 
   // Typing users trong phòng hiện tại
-  const currentTypingUsers = computed(() => {
-    return (typingMap.value[String(activeRoomId.value)] || []).filter(name => name !== currentUser.value.name)
-  })
+  const currentTypingUsers = computed(() =>
+    (typingMap.value[String(activeRoomId.value)] || []).filter(name => name !== currentUser.value.name))
 
   const typingDisplayText = computed(() => {
     const users = currentTypingUsers.value
     if (users.length === 0) return ''
     if (users.length === 1) return `${users[0]} đang soạn tin...`
+
     return `${users[0]} và ${users.length - 1} người khác đang soạn tin...`
   })
 
-  // 1. Danh sách phòng chat phù hợp từ khóa tìm kiếm (Ghim lên đầu, từ mới nhất đến muộn nhất)
+  // 1. Danh sách phòng chat phù hợp từ khóa tìm kiếm (Ghim lên đầu, mới nhất trước)
   const sortedAndFilteredRooms = computed(() => {
     let list = [...chatRooms.value]
 
     if (searchKeyword.value.trim()) {
-      const q = searchKeyword.value.toLowerCase().trim()
-      list = list.filter(r => r.name.toLowerCase().includes(q))
+      const q = searchKeyword.value.trim()
+      list = list.filter(r => vnIncludes(r.name, q))
     }
 
     list.sort((a, b) => {
-      // 1. Ghim lên đầu
+      // 1. Ghim lên đầu (Task 2.3)
       if (a.isPinned && !b.isPinned) return -1
       if (!a.isPinned && b.isPinned) return 1
 
-      // 2. Sắp xếp tin nhắn từ mới nhất đến muộn nhất
-      const timeA = new Date(a.updatedAt || a.lastMessage?.time || 0).getTime()
-      const timeB = new Date(b.updatedAt || b.lastMessage?.time || 0).getTime()
+      // 2. Mới nhất trước. updatedAt là ISO từ server, không phải chuỗi "10:35 AM"
+      //    như bản cũ lấy từ lastMessage.time (parse ra NaN nên không sắp xếp được).
+      const timeA = new Date(a.updatedAt || 0).getTime()
+      const timeB = new Date(b.updatedAt || 0).getTime()
+
       return timeB - timeA
     })
 
@@ -217,177 +280,185 @@ export const useChatStore = defineStore('chat', () => {
   const matchingUsersForDirectChat = computed(() => {
     if (!searchKeyword.value.trim()) return []
 
-    const q = searchKeyword.value.toLowerCase().trim()
+    const q = searchKeyword.value.trim()
+
+    // Không phân biệt dấu: gõ "tuan" phải ra "Trần Anh Tuấn"
     return contactList.value.filter(u => {
       if (String(u.userId) === String(currentUser.value.userId)) return false
-      const matchName = u.name.toLowerCase().includes(q)
-      const matchEmail = (u.email || '').toLowerCase().includes(q)
-      const matchCode = (u.employeeCode || '').toLowerCase().includes(q)
-      const matchDept = (u.department || '').toLowerCase().includes(q)
-      return matchName || matchEmail || matchCode || matchDept
+
+      return vnIncludes(u.name, q) || vnIncludes(u.email, q)
+        || vnIncludes(u.employeeCode, q) || vnIncludes(u.department, q)
     })
   })
 
-  const isUserOnline = (userId: string) => {
-    return onlineUsers.value.has(String(userId))
+  const isUserOnline = (userId: string) => onlineUsers.value.has(String(userId))
+
+  /** Thành viên của phòng đang mở, trừ bản thân — dùng cho popup @mention. */
+  const mentionCandidates = computed(() =>
+    activeRoom.value.members.filter(m => String(m.userId) !== String(currentUser.value.userId)))
+
+  /** fetch + báo lỗi gọn, thay cho try/catch lặp lại ở mỗi hàm. */
+  const request = async (url: string, init?: RequestInit) => {
+    try {
+      const res = await fetch(url, init)
+      const data = await res.json().catch(() => null)
+      if (!res.ok) {
+        lastError.value = (data && data.error) || `Lỗi ${res.status}`
+
+        return null
+      }
+
+      return data
+    }
+    catch (e) {
+      lastError.value = 'Không kết nối được tới server chat'
+
+      return null
+    }
   }
+
+  const jsonInit = (method: string, body: any): RequestInit => ({
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
 
   // Fetch danh bạ nhân viên từ backend
   const fetchContacts = async () => {
-    try {
-      const res = await fetch(`${API_CHAT}/contacts`)
-      if (res.ok) {
-        const data = await res.json()
-        if (Array.isArray(data) && data.length > 0) {
-          contactList.value = data
-        }
-      }
-    } catch (e) {
-      console.warn('[ChatStore] Cannot fetch contacts from backend', e)
-    }
+    const data = await request(`${API_CHAT}/contacts`)
+    if (Array.isArray(data)) contactList.value = data
   }
 
   // Fetch Conversations từ Backend theo currentUser
   const fetchConversations = async (targetUserId?: string) => {
     const uid = targetUserId || currentUser.value.userId
-    try {
-      const res = await fetch(`${API_CHAT}/conversations?userId=${uid}`)
-      if (res.ok) {
-        const data = await res.json()
-        if (Array.isArray(data)) {
-          chatRooms.value = data
-          if (data.length > 0) {
-            if (!activeRoomId.value || !chatRooms.value.some(r => String(r.id) === String(activeRoomId.value))) {
-              activeRoomId.value = data[0].id
-            }
-            await fetchMessages(activeRoomId.value)
-          }
-          if (socket && isConnected.value) {
-            socket.emit('join_rooms', data.map(r => r.id))
-          }
-          return
-        }
+    if (!uid) return
+
+    const data = await request(`${API_CHAT}/conversations?userId=${uid}`)
+    if (!Array.isArray(data)) return
+
+    chatRooms.value = data
+
+    if (data.length > 0) {
+      const stillThere = chatRooms.value.some(r => String(r.id) === String(activeRoomId.value))
+      if (!activeRoomId.value || !stillThere) {
+        // Mở phòng đầu danh sách (đã ghim lên đầu, mới nhất trước)
+        await selectRoom(sortedAndFilteredRooms.value[0]?.id ?? data[0].id)
       }
-    } catch (e) {
-      console.warn('[ChatStore] Cannot fetch conversations from backend, using default', e)
+    }
+    else {
+      activeRoomId.value = ''
     }
 
-    // Fallback default mock
-    if (chatRooms.value.length === 0) {
-      chatRooms.value = [
-        {
-          id: 1,
-          type: 'group',
-          name: 'Đất Việt Số - Tổng Công Ty',
-          avatar: 'https://api.dicebear.com/7.x/identicon/svg?seed=DatVietSo',
-          isGroup: true,
-          isPinned: true,
-          myRole: 'owner',
-          members: contactList.value,
-          lastMessage: {
-            content: 'Chào mừng cả đội ngũ tham gia hệ thống DatVietSo!',
-            type: 'text',
-            time: '11:38 AM',
-          },
-          unreadCount: 0,
-        },
-      ]
-      fetchMessages(1)
+    if (socket && isConnected.value) socket.emit('join_rooms', data.map(r => r.id))
+  }
+
+  /**
+   * Tải lịch sử tin nhắn của một phòng (trang mới nhất).
+   *
+   * Backend trả `{ messages, hasMore, oldestId }` và chỉ gửi PAGE_SIZE tin cuối —
+   * bản cũ nhận cả mảng toàn bộ tin của phòng.
+   */
+  const fetchMessages = async (convId: string | number) => {
+    if (!convId) return
+
+    const data = await request(`${API_CHAT}/messages/${convId}?limit=${PAGE_SIZE}`)
+    if (!data || !Array.isArray(data.messages)) return
+
+    messagesMap.value[convId] = data.messages.map(mapApiMessage)
+    hasMoreMap.value[String(convId)] = !!data.hasMore
+  }
+
+  /** Nạp thêm trang tin cũ hơn (nút "Xem tin nhắn cũ hơn"). */
+  const loadOlderMessages = async (convId: string | number = activeRoomId.value) => {
+    const key = String(convId)
+    const list = messagesMap.value[convId]
+    if (!list || list.length === 0 || !hasMoreMap.value[key] || loadingOlder.value) return
+
+    loadingOlder.value = true
+    try {
+      // Con trỏ là tin CŨ NHẤT đang có; _id tăng dần theo thời gian nên server chỉ
+      // cần so sánh _id < before, không dùng OFFSET.
+      const data = await request(`${API_CHAT}/messages/${convId}?limit=${PAGE_SIZE}&before=${list[0].id}`)
+      if (!data || !Array.isArray(data.messages)) return
+
+      const older = data.messages.map(mapApiMessage)
+      messagesMap.value[convId] = [...older, ...list]
+      hasMoreMap.value[key] = !!data.hasMore
+    }
+    finally {
+      loadingOlder.value = false
     }
   }
 
-  // Fetch Messages cho 1 conversation từ Backend
-  const fetchMessages = async (convId: string | number) => {
-    try {
-      const res = await fetch(`${API_CHAT}/messages/${convId}`)
-      if (res.ok) {
-        const msgs = await res.json()
-        if (Array.isArray(msgs)) {
-          messagesMap.value[convId] = msgs.map(m => ({
-            ...m,
-            isMe: String(m.senderId) === String(currentUser.value.userId),
-          }))
-          return
-        }
-      }
-    } catch (e) {
-      console.warn(`[ChatStore] Cannot fetch messages for room ${convId}`, e)
-    }
+  const mapApiMessage = (m: any): ChatMessage => ({
+    ...m,
+    isMe: String(m.senderId) === String(currentUser.value.userId),
+  })
 
-    if (!messagesMap.value[convId]) {
-      messagesMap.value[convId] = [
-        {
-          id: 1,
-          conversationId: convId,
-          senderId: '1',
-          senderName: 'Nguyễn Quản Trị',
-          senderAvatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=Admin',
-          type: 'text',
-          content: 'Chào mừng cả đội ngũ tham gia hệ thống quản trị DatVietSo!',
-          time: '11:38 AM',
-          isMe: true,
-        },
-      ]
+  /** Bộ sưu tập ảnh / video / tệp / liên kết của phòng (Task 3.2). */
+  const fetchAttachments = async (convId: string | number = activeRoomId.value, kind = 'all') => {
+    if (!convId) return
+
+    loadingAttachments.value = true
+    try {
+      const data = await request(`${API_CHAT}/conversations/${convId}/attachments?kind=${kind}`)
+      if (!data) return
+
+      attachments.value = data.items || []
+      attachmentCounts.value = data.counts || { image: 0, video: 0, file: 0, link: 0 }
     }
+    finally {
+      loadingAttachments.value = false
+    }
+  }
+
+  /**
+   * Đánh dấu đã đọc. Mốc `lastReadAt` nằm trong conversations.members[] nên badge
+   * sống qua F5 và đồng bộ sang thiết bị khác — bản cũ chỉ gán unreadCount = 0
+   * trong state nên tải lại trang là badge quay về.
+   */
+  const markRoomRead = async (convId: string | number) => {
+    const room = chatRooms.value.find(r => String(r.id) === String(convId))
+    if (!room || (room.unreadCount === 0 && room.mentionCount === 0)) return
+
+    room.unreadCount = 0
+    room.mentionCount = 0
+
+    if (socket && isConnected.value) {
+      socket.emit('mark_read', { conversation_id: convId, user_id: currentUser.value.userId })
+
+      return
+    }
+    await request(`${API_CHAT}/conversations/${convId}/read`,
+      jsonInit('POST', { userId: currentUser.value.userId }))
   }
 
   // Nhắn tin trực tiếp 1-1 với một người dùng (Direct Chat)
   const openDirectChatWithUser = async (targetUser: ChatUser) => {
-    // 1. Kiểm tra xem phòng direct với targetUser đã có trong chatRooms chưa
+    // 1. Phòng direct với người này đã có trong danh sách chưa?
     const existing = chatRooms.value.find(
-      r => !r.isGroup && r.members.some(m => String(m.userId) === String(targetUser.userId))
+      r => !r.isGroup && r.members.some(m => String(m.userId) === String(targetUser.userId)),
     )
-
     if (existing) {
-      selectRoom(existing.id)
+      await selectRoom(existing.id)
       searchKeyword.value = ''
+
       return existing
     }
 
     // 2. Gọi backend API POST /api/chat/direct
-    try {
-      const res = await fetch(`${API_CHAT}/direct`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          currentUserId: currentUser.value.userId,
-          targetUserId: targetUser.userId,
-        }),
-      })
+    const data = await request(`${API_CHAT}/direct`, jsonInit('POST', {
+      currentUserId: currentUser.value.userId,
+      targetUserId: targetUser.userId,
+    }))
+    if (!data) return null
 
-      if (res.ok) {
-        const data = await res.json()
-        await fetchConversations()
-        selectRoom(data.conversationId)
-        searchKeyword.value = ''
-        return
-      }
-    } catch (e) {
-      console.warn('Error creating direct chat via API, creating local direct room', e)
-    }
-
-    // Fallback tạo local direct room nếu server offline
-    const directId = `direct-${Date.now()}`
-    const newRoom: ChatRoom = {
-      id: directId,
-      type: 'direct',
-      name: targetUser.name,
-      avatar: targetUser.avatar || `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(targetUser.name)}`,
-      isGroup: false,
-      isPinned: false,
-      myRole: 'member',
-      members: [
-        { ...currentUser.value, role: 'member' },
-        { ...targetUser, role: 'member' },
-      ],
-      lastMessage: null,
-      unreadCount: 0,
-    }
-
-    chatRooms.value.unshift(newRoom)
-    selectRoom(directId)
+    await fetchConversations()
+    await selectRoom(data.conversationId)
     searchKeyword.value = ''
-    return newRoom
+
+    return chatRooms.value.find(r => String(r.id) === String(data.conversationId)) || null
   }
 
   // Âm thanh thông báo
@@ -405,9 +476,19 @@ export const useChatStore = defineStore('chat', () => {
       gain.connect(audioCtx.destination)
       osc.start()
       osc.stop(audioCtx.currentTime + 0.3)
-    } catch (e) {
-      // AudioContext not allowed before user gesture
     }
+    catch (e) {
+      // AudioContext bị chặn trước tương tác đầu tiên của người dùng
+    }
+  }
+
+  /** Xin quyền Notification một lần, để thông báo mention hiện được popup. */
+  const requestNotificationPermission = () => {
+    try {
+      if (typeof Notification !== 'undefined' && Notification.permission === 'default')
+        Notification.requestPermission()
+    }
+    catch (e) { /* Safari cũ */ }
   }
 
   // Khởi tạo Socket.io với Auto-reconnect
@@ -418,7 +499,7 @@ export const useChatStore = defineStore('chat', () => {
     if (socket) return
 
     try {
-      socket = io('http://localhost:5000', {
+      socket = io(socketUrl(), {
         reconnection: true,
         reconnectionAttempts: 10,
         reconnectionDelay: 2000,
@@ -426,19 +507,17 @@ export const useChatStore = defineStore('chat', () => {
       })
 
       socket.on('connect', () => {
-        console.log('[Socket] Connected to server, ID:', socket?.id)
         isConnected.value = true
+
+        // user_online TRƯỚC join_rooms: server chỉ cho vào phòng mà mình là thành
+        // viên, và nó cần biết socket này của ai (socket.data.userId).
         socket?.emit('user_online', currentUser.value.userId)
 
-        if (chatRooms.value.length > 0) {
-          socket?.emit('join_rooms', chatRooms.value.map(r => r.id))
-        } else if (activeRoomId.value) {
-          socket?.emit('join_room', activeRoomId.value)
-        }
+        if (chatRooms.value.length > 0) socket?.emit('join_rooms', chatRooms.value.map(r => r.id))
+        else if (activeRoomId.value) socket?.emit('join_room', activeRoomId.value)
       })
 
       socket.on('disconnect', () => {
-        console.log('[Socket] Disconnected from server')
         isConnected.value = false
       })
 
@@ -447,31 +526,94 @@ export const useChatStore = defineStore('chat', () => {
       })
 
       socket.on('user_status_change', ({ userId, status }: { userId: string; status: 'online' | 'offline' }) => {
-        const nextSet = new Set(onlineUsers.value)
-        if (status === 'online') {
-          nextSet.add(String(userId))
-        } else {
-          nextSet.delete(String(userId))
-        }
-        onlineUsers.value = nextSet
+        const next = new Set(onlineUsers.value)
+        if (status === 'online') next.add(String(userId))
+        else next.delete(String(userId))
+        onlineUsers.value = next
       })
 
-      socket.on('direct_chat_created', ({ currentUserId, targetUserId }: any) => {
-        if (String(currentUser.value.userId) === String(currentUserId) || String(currentUser.value.userId) === String(targetUserId)) {
-          fetchConversations()
+      // Phòng mới xuất hiện (tin đầu tiên của chat 1-1, hoặc được thêm vào nhóm)
+      socket.on('direct_chat_created', () => { fetchConversations() })
+      socket.on('group_created', () => { fetchConversations() })
+      socket.on('members_updated', () => { fetchConversations() })
+      socket.on('role_changed', () => { fetchConversations() })
+
+      socket.on('member_removed', ({ conversationId, userId }: any) => {
+        if (String(userId) === String(currentUser.value.userId)) {
+          // Chính mình bị xóa / vừa rời nhóm -> bỏ phòng khỏi sidebar
+          removeRoomLocally(conversationId)
+          lastError.value = 'Bạn không còn trong nhóm này'
+        }
+        else { fetchConversations() }
+      })
+
+      socket.on('conversation_updated', ({ conversationId, name, avatar }: any) => {
+        const room = chatRooms.value.find(r => String(r.id) === String(conversationId))
+        if (room && room.isGroup) {
+          if (name) room.name = name
+          if (avatar) room.avatar = avatar
+        }
+      })
+
+      socket.on('conversation_deleted', ({ conversationId }: any) => {
+        removeRoomLocally(conversationId)
+      })
+
+      // Tab/thiết bị khác của cùng người dùng đã đọc -> tắt badge ở đây luôn
+      socket.on('conversation_read', ({ conversationId }: any) => {
+        const room = chatRooms.value.find(r => String(r.id) === String(conversationId))
+        if (room) {
+          room.unreadCount = 0
+          room.mentionCount = 0
         }
       })
 
       // Nhận tin nhắn qua Socket
-      socket.on('receive_message', (msg: any) => {
-        handleIncomingMessage(msg)
-      })
+      socket.on('receive_message', (msg: any) => { handleIncomingMessage(msg) })
 
       socket.on('message_deleted', ({ message_id }: { message_id: any }) => {
         handleMessageDeleted(message_id)
       })
 
-      // Typing: lưu theo đúng conversation_id của người đang soạn (không dùng phòng đang mở)
+      socket.on('message_reaction', ({ messageId, conversationId, reactions }: any) => {
+        const list = messagesMap.value[conversationId] || []
+        const msg = list.find(m => String(m.id) === String(messageId))
+        if (msg) msg.reactions = reactions || []
+      })
+
+      // Server từ chối tin (không phải thành viên, phòng không tồn tại...)
+      socket.on('message_error', ({ clientTempId, error }: any) => {
+        lastError.value = error || 'Không gửi được tin nhắn'
+        if (!clientTempId) return
+
+        for (const convId in messagesMap.value) {
+          const msg = messagesMap.value[convId].find(m => String(m.id) === String(clientTempId))
+          if (msg) {
+            msg.pending = false
+            msg.failed = true
+            break
+          }
+        }
+      })
+
+      // Thông báo riêng khi bị @ (Task 4.1) — server parse mention theo thành viên
+      // thật, không dựa vào việc client tự so chuỗi tên như bản cũ.
+      socket.on('mention_notification', (alert: MentionAlert) => {
+        lastMention.value = alert
+        playNotificationSound()
+        try {
+          if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+            const where = alert.isGroup && alert.conversationName ? ` trong ${alert.conversationName}` : ''
+            new Notification(`${alert.senderName} đã nhắc đến bạn${where}`, {
+              body: alert.content,
+              icon: alert.senderAvatar,
+            })
+          }
+        }
+        catch (e) { /* Notification bị chặn */ }
+      })
+
+      // Typing: lưu theo đúng conversation_id của người đang soạn
       const typingTimers: Record<string, any> = {}
 
       const removeTyping = (convKey: string, userName: string) => {
@@ -479,125 +621,141 @@ export const useChatStore = defineStore('chat', () => {
         typingMap.value = { ...typingMap.value, [convKey]: list.filter(n => n !== userName) }
       }
 
-      socket.on('display_typing', ({ conversation_id, user_id, user_name }: { conversation_id: any; user_id?: string; user_name: string }) => {
+      socket.on('display_typing', ({ conversation_id, user_id, user_name }: any) => {
         if (conversation_id === undefined || conversation_id === null) return
         if (user_id && String(user_id) === String(currentUser.value.userId)) return
+
         const convKey = String(conversation_id)
         const list = typingMap.value[convKey] || []
-        if (!list.includes(user_name)) {
-          typingMap.value = { ...typingMap.value, [convKey]: [...list, user_name] }
-        }
+        if (!list.includes(user_name)) typingMap.value = { ...typingMap.value, [convKey]: [...list, user_name] }
+
         // Tự ẩn sau 5s nếu không nhận được stop_typing (mất kết nối, đóng tab...)
         const timerKey = `${convKey}_${user_name}`
         if (typingTimers[timerKey]) clearTimeout(typingTimers[timerKey])
         typingTimers[timerKey] = setTimeout(() => removeTyping(convKey, user_name), 5000)
       })
 
-      socket.on('hide_typing', ({ conversation_id, user_name }: { conversation_id: any; user_name?: string }) => {
+      socket.on('hide_typing', ({ conversation_id, user_name }: any) => {
         if (conversation_id === undefined || conversation_id === null) return
+
         const convKey = String(conversation_id)
-        if (user_name) {
-          removeTyping(convKey, user_name)
-        } else {
-          typingMap.value = { ...typingMap.value, [convKey]: [] }
-        }
+        if (user_name) removeTyping(convKey, user_name)
+        else typingMap.value = { ...typingMap.value, [convKey]: [] }
       })
-    } catch (e) {
-      console.warn('[Socket] Could not connect to backend server', e)
+    }
+    catch (e) {
+      lastError.value = 'Không kết nối được tới server chat'
     }
   }
 
-  const selectRoom = (roomId: string | number) => {
-    activeRoomId.value = roomId
-    const room = chatRooms.value.find(r => r.id === roomId)
-    if (room) room.unreadCount = 0
-
-    fetchMessages(roomId)
-
-    if (socket && isConnected.value) {
-      socket.emit('join_room', roomId)
+  const removeRoomLocally = (conversationId: any) => {
+    chatRooms.value = chatRooms.value.filter(r => String(r.id) !== String(conversationId))
+    delete messagesMap.value[conversationId]
+    delete hasMoreMap.value[String(conversationId)]
+    if (String(activeRoomId.value) === String(conversationId)) {
+      activeRoomId.value = chatRooms.value[0]?.id ?? ''
+      if (activeRoomId.value) fetchMessages(activeRoomId.value)
     }
+  }
+
+  const selectRoom = async (roomId: string | number) => {
+    if (!roomId) return
+
+    activeRoomId.value = roomId
+    await fetchMessages(roomId)
+    markRoomRead(roomId)
+
+    if (socket && isConnected.value) socket.emit('join_room', roomId)
+    if (isProfileRightOpen.value) fetchAttachments(roomId)
   }
 
   // Xử lý tin nhắn đến và chống Duplicate triệt để
   const handleIncomingMessage = (data: any) => {
-    const convId = data.conversation_id || data.conversationId || activeRoomId.value
-    if (!messagesMap.value[convId]) messagesMap.value[convId] = []
+    const convId = data.conversation_id || data.conversationId
+    if (!convId) return
 
+    if (!messagesMap.value[convId]) messagesMap.value[convId] = []
     const list = messagesMap.value[convId]
 
-    // 1. Kiểm tra nếu tin nhắn theo ID database đã tồn tại -> bỏ qua
-    const alreadyExists = list.some(m => String(m.id) === String(data.id))
-    if (alreadyExists) return
+    // 1. Tin đã có theo ID database -> bỏ qua
+    if (list.some(m => String(m.id) === String(data.id))) return
 
-    // 2. Chống Duplicate cho Người gửi: Reconcile theo client_temp_id
-    if (data.client_temp_id) {
-      const pendingIndex = list.findIndex(m => m.id === data.client_temp_id)
-      if (pendingIndex !== -1) {
-        list[pendingIndex].id = data.id
-        if (data.metadata) {
-          list[pendingIndex].metadata = typeof data.metadata === 'string' ? JSON.parse(data.metadata) : data.metadata
-        }
-        return
-      }
-    }
-
-    // 3. Fallback chống Duplicate nếu người gửi là chính tôi và có local pending message
     const isSenderMe = String(data.sender_id || data.senderId) === String(currentUser.value.userId)
-    if (isSenderMe) {
-      const pendingIndex = list.findIndex(m => String(m.id).startsWith('local-') && m.type === data.type)
-      if (pendingIndex !== -1) {
-        list[pendingIndex].id = data.id
+
+    // 2. Chống Duplicate cho Người gửi: thay tin tạm bằng tin thật theo client_temp_id
+    if (data.client_temp_id) {
+      const pending = list.find(m => String(m.id) === String(data.client_temp_id))
+      if (pending) {
+        pending.id = data.id
+        pending.pending = false
+        pending.failed = false
+        pending.createdAt = data.created_at
+        pending.mentions = data.mentions || []
+        pending.attachmentKind = data.attachment_kind || null
         if (data.metadata) {
-          list[pendingIndex].metadata = typeof data.metadata === 'string' ? JSON.parse(data.metadata) : data.metadata
+          pending.metadata = typeof data.metadata === 'string' ? JSON.parse(data.metadata) : data.metadata
         }
+
         return
       }
     }
 
-    // 4. Tin nhắn từ người khác -> push vào danh sách
+    const isSystem = data.is_system || data.type === 'system'
+
     const newMsg: ChatMessage = {
-      id: data.id || Date.now(),
+      id: data.id,
       conversationId: convId,
       senderId: data.sender_id || data.senderId,
       senderName: data.sender_name || data.senderName || 'Thành viên',
       senderAvatar: data.sender_avatar || data.senderAvatar,
       type: data.type || 'text',
       content: data.content,
-      metadata: typeof data.metadata === 'string' ? JSON.parse(data.metadata) : data.metadata,
+      metadata: typeof data.metadata === 'string' ? JSON.parse(data.metadata) : (data.metadata || {}),
+      mentions: data.mentions || [],
+      attachmentKind: data.attachment_kind || null,
+      reactions: data.reactions || [],
+      isSystem,
       createdAt: data.created_at || new Date().toISOString(),
-      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      isMe: isSenderMe,
+      time: new Date(data.created_at || Date.now())
+        .toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      isMe: isSenderMe && !isSystem,
     }
 
     list.push(newMsg)
 
-    // Âm thanh thông báo nếu có mention
-    if (!newMsg.isMe) {
-      if (newMsg.content.includes(`@${currentUser.value.name}`)) {
-        playNotificationSound()
-        if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-          new Notification(`Bạn được nhắc đến bởi ${newMsg.senderName}`, {
-            body: newMsg.content,
-            icon: newMsg.senderAvatar,
-          })
-        }
-      }
+    const room = chatRooms.value.find(r => String(r.id) === String(convId))
+    if (!room) {
+      // Tin từ cuộc trò chuyện vừa được tạo / vừa được thêm vào
+      fetchConversations()
+
+      return
     }
 
-    const room = chatRooms.value.find(r => String(r.id) === String(convId))
-    if (room) {
-      room.updatedAt = new Date().toISOString()
-      room.lastMessage = {
-        id: newMsg.id,
-        content: `${newMsg.senderName}: ${newMsg.content}`,
-        type: newMsg.type,
-        time: newMsg.time,
-      }
-      if (String(convId) !== String(activeRoomId.value)) room.unreadCount++
-    } else {
-      // Tin nhắn từ cuộc trò chuyện mới được tạo
-      fetchConversations()
+    room.updatedAt = newMsg.createdAt
+    room.lastMessage = {
+      id: newMsg.id,
+      content: newMsg.content,
+      type: newMsg.type,
+      senderId: newMsg.senderId,
+      senderName: newMsg.senderName,
+      time: newMsg.time,
+      createdAt: newMsg.createdAt,
+    }
+
+    // Đang mở phòng này -> coi như đã đọc; phòng khác -> tăng badge.
+    // Tin hệ thống và tin của chính mình không tính là chưa đọc (khớp cách backend đếm).
+    if (String(convId) === String(activeRoomId.value)) {
+      if (!isSenderMe && !isSystem) markRoomRead(convId)
+    }
+    else if (!isSenderMe && !isSystem) {
+      room.unreadCount += 1
+      if ((newMsg.mentions || []).includes(String(currentUser.value.userId))) room.mentionCount += 1
+    }
+
+    // Đính kèm mới -> làm mới panel Bộ sưu tập nếu đang mở đúng phòng
+    if (newMsg.attachmentKind && isProfileRightOpen.value
+      && String(convId) === String(activeRoomId.value)) {
+      fetchAttachments(convId)
     }
   }
 
@@ -607,17 +765,31 @@ export const useChatStore = defineStore('chat', () => {
       if (msg) {
         msg.isDeleted = true
         msg.content = 'Tin nhắn này đã bị xóa'
+        msg.metadata = {}
+        msg.reactions = []
         break
       }
     }
   }
 
-  // Gửi tin nhắn Text / Media / Location
+  /**
+   * Gửi tin nhắn Text / Media / Location.
+   *
+   * Mention KHÔNG gửi kèm: server tự parse "@tên" theo danh sách thành viên thật
+   * (xem services/chat.js). Nếu client gửi mảng mentions thì chỉ cần sửa payload
+   * là bắn thông báo cho người không liên quan.
+   */
   const sendMessage = (content: string, type: MessageType = 'text', metadata?: MessageMetadata) => {
+    if (!hasActiveRoom.value) {
+      lastError.value = 'Hãy chọn một cuộc trò chuyện trước khi gửi tin'
+
+      return
+    }
     if (!content.trim() && type === 'text') return
 
     const convId = activeRoomId.value
     const tempId = `local-${Date.now()}`
+    const now = new Date()
 
     const newMsg: ChatMessage = {
       id: tempId,
@@ -627,9 +799,13 @@ export const useChatStore = defineStore('chat', () => {
       senderAvatar: currentUser.value.avatar,
       type,
       content,
-      metadata,
-      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      metadata: metadata || {},
+      mentions: [],
+      reactions: [],
+      createdAt: now.toISOString(),
+      time: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       isMe: true,
+      pending: true,
     }
 
     if (!messagesMap.value[convId]) messagesMap.value[convId] = []
@@ -637,37 +813,67 @@ export const useChatStore = defineStore('chat', () => {
 
     const room = chatRooms.value.find(r => String(r.id) === String(convId))
     if (room) {
-      room.updatedAt = new Date().toISOString()
+      room.updatedAt = newMsg.createdAt
       room.lastMessage = {
         id: newMsg.id,
-        content: `Bạn: ${type === 'media' ? '[Tệp đính kèm]' : type === 'location' ? '[Vị trí]' : content}`,
+        content: type === 'media' ? '[Tệp đính kèm]' : type === 'location' ? '[Vị trí]' : content,
         type,
+        senderId: currentUser.value.userId,
+        senderName: currentUser.value.name,
         time: newMsg.time,
+        createdAt: newMsg.createdAt,
       }
     }
 
-    if (socket && isConnected.value) {
-      socket.emit('send_message', {
-        conversation_id: convId,
-        sender_id: currentUser.value.userId,
-        sender_name: currentUser.value.name,
-        sender_avatar: currentUser.value.avatar,
-        type,
-        content,
-        metadata: metadata || {},
-        client_temp_id: tempId, // Gửi tempId để backend trả về cho client reconcile
-      })
+    if (!socket || !isConnected.value) {
+      newMsg.pending = false
+      newMsg.failed = true
+      lastError.value = 'Mất kết nối tới server chat, tin nhắn chưa được gửi'
+
+      return
     }
+
+    socket.emit('send_message', {
+      conversation_id: convId,
+      sender_id: currentUser.value.userId,
+      sender_name: currentUser.value.name,
+      sender_avatar: currentUser.value.avatar,
+      type,
+      content,
+      metadata: metadata || {},
+      client_temp_id: tempId, // backend trả lại để client ghép tin tạm với tin thật
+    })
   }
 
+  /** Chỉ xóa được tin của chính mình — server kiểm tra lại điều này. */
   const deleteMessage = (messageId: any) => {
+    const msg = activeMessages.value.find(m => String(m.id) === String(messageId))
+    if (msg && !msg.isMe) {
+      lastError.value = 'Chỉ xóa được tin nhắn của chính bạn'
+
+      return
+    }
+
     handleMessageDeleted(messageId)
+
     if (socket && isConnected.value) {
       socket.emit('delete_message', {
         message_id: messageId,
         conversation_id: activeRoomId.value,
+        user_id: currentUser.value.userId,
       })
     }
+  }
+
+  /** Thả / bỏ cảm xúc. Bấm lại cùng loại là bỏ (toggle). */
+  const toggleReaction = async (messageId: any, reaction: ReactionType) => {
+    const data = await request(`${API_CHAT}/messages/${messageId}/reactions`,
+      jsonInit('POST', { userId: currentUser.value.userId, reaction }))
+    if (!data) return
+
+    const list = messagesMap.value[activeRoomId.value] || []
+    const msg = list.find(m => String(m.id) === String(messageId))
+    if (msg) msg.reactions = data.reactions || []
   }
 
   const emitTyping = () => {
@@ -691,159 +897,141 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   const togglePinRoom = async (roomId: string | number) => {
-    const room = chatRooms.value.find(r => r.id === roomId)
-    if (room) {
-      room.isPinned = !room.isPinned
-      try {
-        await fetch(`${API_CHAT}/conversations/${roomId}/pin`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ userId: currentUser.value.userId, isPinned: room.isPinned }),
-        })
-      } catch (e) {
-        console.warn('Pin sync error', e)
-      }
-    }
+    const room = chatRooms.value.find(r => String(r.id) === String(roomId))
+    if (!room) return
+
+    const next = !room.isPinned
+    room.isPinned = next
+
+    const data = await request(`${API_CHAT}/conversations/${roomId}/pin`,
+      jsonInit('POST', { userId: currentUser.value.userId, isPinned: next }))
+
+    // Server từ chối -> trả lại trạng thái cũ, không để UI lệch với DB
+    if (!data) room.isPinned = !next
   }
 
-  // Tạo nhóm mới và gọi API
+  // Tạo nhóm mới (Task 1.3: tối thiểu 3 thành viên)
   const createGroup = async (name: string, avatar: string, selectedMembers: ChatUser[]) => {
     const fullMembers = [
       { ...currentUser.value, role: 'owner' as GroupRole },
-      ...selectedMembers.filter(m => String(m.userId) !== String(currentUser.value.userId)).map(m => ({ ...m, role: 'member' as GroupRole })),
+      ...selectedMembers
+        .filter(m => String(m.userId) !== String(currentUser.value.userId))
+        .map(m => ({ ...m, role: 'member' as GroupRole })),
     ]
 
-    if (fullMembers.length < 3) {
-      throw new Error('Nhóm chat phải có tối thiểu 3 thành viên!')
-    }
+    if (fullMembers.length < 3) throw new Error('Nhóm chat phải có tối thiểu 3 thành viên!')
 
-    try {
-      const res = await fetch(`${API_CHAT}/groups`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: name.trim() || 'Nhóm mới',
-          avatar: avatar || 'https://api.dicebear.com/7.x/identicon/svg?seed=DatVietSo',
-          members: fullMembers,
-          createdBy: currentUser.value,
-        }),
-      })
-
-      if (res.ok) {
-        await fetchConversations()
-        return
-      }
-    } catch (e) {
-      console.warn('Backend API error on group creation, updating local state', e)
-    }
-
-    const newGroupId = Date.now()
-    const newRoom: ChatRoom = {
-      id: newGroupId,
-      type: 'group',
+    const data = await request(`${API_CHAT}/groups`, jsonInit('POST', {
       name: name.trim() || 'Nhóm mới',
       avatar: avatar || 'https://api.dicebear.com/7.x/identicon/svg?seed=DatVietSo',
-      isGroup: true,
-      isPinned: false,
-      myRole: 'owner',
       members: fullMembers,
-      lastMessage: {
-        content: `${currentUser.value.name} đã tạo nhóm mới.`,
-        type: 'text',
-        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      },
-      unreadCount: 0,
-    }
+      createdBy: currentUser.value,
+    }))
+    if (!data) throw new Error(lastError.value || 'Không tạo được nhóm')
 
-    chatRooms.value.unshift(newRoom)
-    activeRoomId.value = newGroupId
-    return newRoom
+    await fetchConversations()
+    await selectRoom(data.conversationId)
+
+    return data
+  }
+
+  /** Đổi tên nhóm / ảnh đại diện (owner + admin) — Task 1.4. */
+  const updateGroupInfo = async (payload: { name?: string; avatar?: string }) => {
+    const room = activeRoom.value
+    if (!room.id || !room.isGroup) return
+
+    const data = await request(`${API_CHAT}/groups/${room.id}`, jsonInit('PUT', {
+      ...payload,
+      requesterUserId: currentUser.value.userId,
+    }))
+    if (!data) throw new Error(lastError.value || 'Không cập nhật được nhóm')
+
+    if (data.name) room.name = data.name
+    if (data.avatar) room.avatar = data.avatar
+
+    return data
   }
 
   const addMembersToCurrentGroup = async (newMembers: ChatUser[]) => {
     const room = activeRoom.value
-    if (!room || !room.isGroup) return
+    if (!room.id || !room.isGroup) return
 
-    try {
-      await fetch(`${API_CHAT}/groups/${room.id}/members`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ members: newMembers }),
-      })
-      await fetchConversations()
-    } catch (e) {
-      console.warn('Error adding members via API', e)
-    }
+    const data = await request(`${API_CHAT}/groups/${room.id}/members`, jsonInit('POST', {
+      members: newMembers,
+      requesterUserId: currentUser.value.userId,
+    }))
+    if (!data) throw new Error(lastError.value || 'Không thêm được thành viên')
 
-    newMembers.forEach(m => {
-      const exists = room.members.some(mem => String(mem.userId) === String(m.userId))
-      if (!exists) room.members.push({ ...m, role: 'member' })
-    })
+    // Tin hệ thống "X đã thêm Y vào nhóm" do SERVER sinh và phát qua socket.
+    // Bản cũ gọi sendMessage() ở đây nên dòng đó hiện như tin nhắn thường của
+    // người thao tác, và ai tắt tab trước khi API xong thì không có dòng nào.
+    await fetchConversations()
 
-    sendMessage(`${currentUser.value.name} đã thêm ${newMembers.map(m => m.name).join(', ')} vào nhóm.`, 'text')
+    return data
   }
 
   const changeMemberRole = async (userId: string, newRole: GroupRole) => {
     const room = activeRoom.value
-    if (!room || !room.isGroup) return
-    if (room.myRole !== 'owner') {
-      throw new Error('Chỉ Trưởng nhóm (Owner) mới có quyền đổi vai trò hoặc nhường quyền!')
-    }
+    if (!room.id || !room.isGroup) return
+    if (room.myRole !== 'owner') throw new Error('Chỉ Trưởng nhóm (Owner) mới có quyền đổi vai trò hoặc nhường quyền!')
 
-    try {
-      await fetch(`${API_CHAT}/groups/${room.id}/role`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          targetUserId: userId,
-          newRole,
-          requesterUserId: currentUser.value.userId,
-        }),
-      })
-    } catch (e) {
-      console.warn('Error changing role via API', e)
-    }
+    const data = await request(`${API_CHAT}/groups/${room.id}/role`, jsonInit('PUT', {
+      targetUserId: userId,
+      newRole,
+      requesterUserId: currentUser.value.userId,
+    }))
+    if (!data) throw new Error(lastError.value || 'Không đổi được vai trò')
 
-    const target = room.members.find(m => String(m.userId) === String(userId))
-    if (!target) return
+    await fetchConversations()
 
-    if (newRole === 'owner') {
-      const me = room.members.find(m => String(m.userId) === String(currentUser.value.userId))
-      if (me) me.role = 'admin'
-      target.role = 'owner'
-      room.myRole = 'admin'
-      sendMessage(`${currentUser.value.name} đã nhường quyền Trưởng nhóm cho ${target.name}.`, 'text')
-    } else {
-      target.role = newRole
-      const roleText = newRole === 'admin' ? 'Phó nhóm (Admin)' : 'Thành viên (Member)'
-      sendMessage(`${currentUser.value.name} đã bổ nhiệm ${target.name} làm ${roleText}.`, 'text')
-    }
+    return data
   }
 
   const removeMemberFromGroup = async (userId: string) => {
     const room = activeRoom.value
-    if (!room || !room.isGroup) return
-    if (room.myRole !== 'owner') {
-      throw new Error('Chỉ Trưởng nhóm (Owner) mới có quyền xóa thành viên khỏi nhóm!')
-    }
+    if (!room.id || !room.isGroup) return
+    if (room.myRole !== 'owner') throw new Error('Chỉ Trưởng nhóm (Owner) mới có quyền xóa thành viên khỏi nhóm!')
 
-    try {
-      await fetch(`${API_CHAT}/groups/${room.id}/members/${userId}?requesterUserId=${currentUser.value.userId}`, {
-        method: 'DELETE',
-      })
-    } catch (e) {
-      console.warn('Error removing member via API', e)
-    }
+    const url = `${API_CHAT}/groups/${room.id}/members/${userId}?requesterUserId=${currentUser.value.userId}`
+    const data = await request(url, { method: 'DELETE' })
+    if (!data) throw new Error(lastError.value || 'Không xóa được thành viên')
 
-    const index = room.members.findIndex(m => String(m.userId) === String(userId))
-    if (index !== -1) {
-      const removedName = room.members[index].name
-      room.members.splice(index, 1)
-      sendMessage(`${currentUser.value.name} đã xóa ${removedName} khỏi nhóm.`, 'text')
-    }
+    await fetchConversations()
+
+    return data
   }
 
-  // Cập nhật người dùng hiện tại khi đăng nhập/đăng xuất
+  /** Tự rời nhóm. Owner rời thì server tự chuyển quyền cho người phù hợp. */
+  const leaveCurrentGroup = async () => {
+    const room = activeRoom.value
+    if (!room.id || !room.isGroup) return
+
+    const data = await request(`${API_CHAT}/groups/${room.id}/leave`,
+      jsonInit('POST', { userId: currentUser.value.userId }))
+    if (!data) throw new Error(lastError.value || 'Không rời được nhóm')
+
+    removeRoomLocally(room.id)
+    isProfileRightOpen.value = false
+
+    return data
+  }
+
+  /** Xóa cả cuộc trò chuyện kèm toàn bộ tin nhắn (nhóm: chỉ owner). */
+  const deleteCurrentConversation = async () => {
+    const room = activeRoom.value
+    if (!room.id) return
+
+    const url = `${API_CHAT}/conversations/${room.id}?requesterUserId=${currentUser.value.userId}`
+    const data = await request(url, { method: 'DELETE' })
+    if (!data) throw new Error(lastError.value || 'Không xóa được cuộc trò chuyện')
+
+    removeRoomLocally(room.id)
+    isProfileRightOpen.value = false
+
+    return data
+  }
+
+  // Cập nhật người dùng hiện tại khi đăng nhập / đăng xuất
   const setCurrentUser = (userData: any) => {
     if (userData) {
       currentUser.value = {
@@ -855,26 +1043,23 @@ export const useChatStore = defineStore('chat', () => {
         department: userData.department,
         position: userData.position,
       }
-    } else {
-      currentUser.value = {
-        userId: '1',
-        name: 'Nguyễn Quản Trị',
-        avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=Admin',
-        email: 'admin@datvietso.vn',
-        employeeCode: 'DVS-001',
-      }
+    }
+    else {
+      currentUser.value = { userId: '', name: 'Khách', avatar: '' }
     }
 
-    activeRoomId.value = 0
+    activeRoomId.value = ''
     chatRooms.value = []
     messagesMap.value = {}
+    hasMoreMap.value = {}
+    attachments.value = []
+
+    if (!currentUser.value.userId) return
 
     fetchContacts()
     fetchConversations()
 
-    if (socket && isConnected.value) {
-      socket.emit('user_online', currentUser.value.userId)
-    }
+    if (socket && isConnected.value) socket.emit('user_online', currentUser.value.userId)
   }
 
   const disconnectSocket = () => {
@@ -891,32 +1076,51 @@ export const useChatStore = defineStore('chat', () => {
     chatRooms,
     activeRoomId,
     activeRoom,
+    hasActiveRoom,
     activeMessages,
+    hasMoreMessages,
+    loadingOlder,
     onlineUsers,
     currentTypingUsers,
     typingDisplayText,
     searchKeyword,
     sortedAndFilteredRooms,
     matchingUsersForDirectChat,
+    mentionCandidates,
     isProfileRightOpen,
     isConnected,
+    attachments,
+    attachmentCounts,
+    loadingAttachments,
+    lastError,
+    lastMention,
+    totalUnread,
+    totalMentions,
     isUserOnline,
     initSocket,
     setCurrentUser,
     disconnectSocket,
+    requestNotificationPermission,
     fetchContacts,
     fetchConversations,
     fetchMessages,
+    loadOlderMessages,
+    fetchAttachments,
+    markRoomRead,
     openDirectChatWithUser,
     selectRoom,
     sendMessage,
     deleteMessage,
+    toggleReaction,
     emitTyping,
     emitStopTyping,
     togglePinRoom,
     createGroup,
+    updateGroupInfo,
     addMembersToCurrentGroup,
     changeMemberRole,
     removeMemberFromGroup,
+    leaveCurrentGroup,
+    deleteCurrentConversation,
   }
 })

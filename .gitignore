@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Biến môi trường — không commit, dùng .env.example làm mẫu
+.env
+.env.local
+.env.*.local
+
+# Build output
+dist/
+.vite/
+
+# File người dùng upload
+backend/uploads/*
+!backend/uploads/.gitkeep
+
+# Log
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/

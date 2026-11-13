@@ -59,27 +59,41 @@ const handleClose = () => {
   emit('update:modelValue', false)
 }
 
-const handleCreateGroup = () => {
+const isCreating = ref(false)
+
+/**
+ * PHẢI await store.createGroup(): nó gọi API và có thể ném lỗi.
+ * Bản cũ gọi không await trong try/catch nên promise bị từ chối không rơi vào
+ * catch — modal cứ đóng và báo thành công dù server đã trả lỗi.
+ */
+const handleCreateGroup = async () => {
   errorMessage.value = ''
 
   if (!groupName.value.trim()) {
     errorMessage.value = 'Vui lòng nhập tên nhóm chat!'
+
     return
   }
 
   // Task 1.3 Validation: Tối thiểu 3 thành viên
   if (!isValidMemberCount.value) {
     errorMessage.value = 'Nhóm chat bắt buộc phải có tối thiểu 3 thành viên (Bạn + ít nhất 2 người khác)!'
+
     return
   }
 
+  isCreating.value = true
   try {
     const selectedUsers: ChatUser[] = store.contactList.filter(c => selectedUserIds.value.includes(c.userId))
-    const newGroup = store.createGroup(groupName.value, groupAvatar.value, selectedUsers)
+    const newGroup = await store.createGroup(groupName.value, groupAvatar.value, selectedUsers)
     emit('groupCreated', newGroup)
     emit('update:modelValue', false)
-  } catch (err: any) {
+  }
+  catch (err: any) {
     errorMessage.value = err.message || 'Lỗi khi tạo nhóm'
+  }
+  finally {
+    isCreating.value = false
   }
 }
 </script>
@@ -235,6 +249,7 @@ const handleCreateGroup = () => {
         </v-btn>
         <v-btn
           color="primary"
+          :loading="isCreating"
           :disabled="!isValidMemberCount || !groupName.trim()"
           @click="handleCreateGroup"
         >

@@ -1,69 +1,131 @@
-const fs = require('fs');
+#!/usr/bin/env node
+/**
+ * Migration MongoDB cho datvietso. Hệ thống không còn dùng MySQL.
+ *
+ *   npm run migrate         tạo/cập nhật 19 collection + validator + index
+ *   npm run seed            nạp dữ liệu mẫu (giữ dữ liệu đang có)
+ *   npm run migrate:fresh   xóa sạch rồi tạo lại và nạp dữ liệu mẫu
+ *
+ * Cờ:
+ *   --fresh   DROP collection trước khi tạo lại. XÓA DỮ LIỆU THẬT.
+ *   --seed    nạp dữ liệu mẫu từ db/seed.js
+ *   --only=a,b  chỉ xử lý các collection này, không đụng phần còn lại
+ *   --quiet   chỉ in dòng tổng kết
+ *   --help    in hướng dẫn
+ *
+ * Làm mới riêng dữ liệu chat, giữ nguyên tài sản / CRM / kanban:
+ *   node migrate.js --fresh --seed --only=conversations,messages
+ */
 const path = require('path');
-const mysql = require('mysql2/promise');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
-async function runMigration() {
-    console.log('--- ĐANG BẮT ĐẦU MIGRATION CƠ SỞ DỮ LIỆU DATVIETSO ---');
-    console.log(`Kết nối tới DB: ${process.env.DB_HOST}:${process.env.DB_PORT || 3306} | Database: ${process.env.DB_NAME}`);
+const { connectMongo, closeMongo } = require('./db/mongo');
+const { syncSchema, COLLECTION_NAMES } = require('./db/schema');
+const { seed } = require('./db/seed');
 
-    // Kết nối không chỉ định database trước để tạo database nếu chưa có
-    const connection = await mysql.createConnection({
-        host: process.env.DB_HOST || 'localhost',
-        port: Number(process.env.DB_PORT) || 3306,
-        user: process.env.DB_USER || 'root',
-        password: process.env.DB_PASSWORD || '',
-        multipleStatements: true,
-    });
+const args = process.argv.slice(2);
+const has = (flag) => args.includes(flag);
 
-    try {
-        const dbName = process.env.DB_NAME || 'datvietso';
-        const isFresh = process.argv.includes('--fresh');
+const isFresh = has('--fresh');
+const shouldSeed = has('--seed');
+const verbose = !has('--quiet');
 
-        if (isFresh) {
-            console.log(`-> Đang làm mới database (--fresh): Xóa database cũ '${dbName}'...`);
-            await connection.query(`DROP DATABASE IF EXISTS \`${dbName}\`;`);
-            console.log(`✔ Đã xóa database cũ.`);
-        }
+/** --only=conversations,messages -> ['conversations', 'messages'] */
+const onlyArg = args.find((a) => a.startsWith('--only='));
+const only = onlyArg
+  ? onlyArg.slice('--only='.length).split(',').map((s) => s.trim()).filter(Boolean)
+  : null;
 
-        await connection.query(`CREATE DATABASE IF NOT EXISTS \`${dbName}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`);
-        await connection.query(`USE \`${dbName}\`;`);
-        console.log(`✔ Đã chọn cơ sở dữ liệu: ${dbName}`);
+function printHelp() {
+  console.log(`
+Migration MongoDB cho datvietso
 
-        // 1. Chạy Full Schema
-        const schemaPath = path.join(__dirname, 'migrations', '20261109_full_schema_datvietso.sql');
-        if (fs.existsSync(schemaPath)) {
-            console.log('-> Đang thực thi: 20261109_full_schema_datvietso.sql...');
-            const schemaSql = fs.readFileSync(schemaPath, 'utf8');
-            await connection.query(schemaSql);
-            console.log('✔ Hoàn thành tạo cấu trúc bảng (Schema)!');
-        }
+  node migrate.js                  tạo/cập nhật collection, validator, index
+  node migrate.js --seed           nạp thêm dữ liệu mẫu
+  node migrate.js --fresh --seed   xóa sạch rồi tạo lại và nạp dữ liệu mẫu
 
-        // 2. Chạy Seed Data (nếu có tham số --seed)
-        const shouldSeed = process.argv.includes('--seed');
-        if (shouldSeed) {
-            const seedPath = path.join(__dirname, 'migrations', '20261109_seed_data.sql');
-            if (fs.existsSync(seedPath)) {
-                console.log('-> Đang nạp dữ liệu mẫu: 20261109_seed_data.sql...');
-                const seedSql = fs.readFileSync(seedPath, 'utf8');
-                await connection.query(seedSql);
-                console.log('✔ Nạp dữ liệu mẫu (Seed Data) thành công!');
-            }
-        }
+  --fresh     DROP collection trước khi tạo lại (xóa dữ liệu)
+  --seed      nạp dữ liệu mẫu
+  --only=a,b  chỉ xử lý các collection này
+  --quiet     chỉ in dòng tổng kết
 
-        // Hiển thị danh sách các bảng đã tạo thành công
-        const [tables] = await connection.query('SHOW TABLES');
-        console.log('\n=== DANH SÁCH BẢNG TRONG DATABASE ===');
-        tables.forEach((row, idx) => {
-            console.log(`${idx + 1}. ${Object.values(row)[0]}`);
-        });
-
-        console.log('\n✔ MIGRATION THÀNH CÔNG RỰC RỠ!');
-    } catch (error) {
-        console.error('❌ Lỗi khi thực thi Migration:', error.message);
-    } finally {
-        await connection.end();
-    }
+Làm mới riêng dữ liệu chat, giữ nguyên tài sản / CRM / kanban:
+  node migrate.js --fresh --seed --only=conversations,messages
+`);
 }
 
-runMigration();
+async function main() {
+  if (has('--help') || has('-h')) return printHelp();
+
+  const uri = process.env.MONGO_URI;
+  if (!uri) {
+    throw new Error('Thiếu MONGO_URI trong backend/.env — copy từ backend/.env.example rồi điền lại.');
+  }
+
+  // Che mật khẩu khi in connection string ra log
+  const safeUri = uri.replace(/\/\/([^:/@]+):([^@]+)@/, '//$1:***@');
+
+  console.log('--- MIGRATION MONGODB CHO DATVIETSO ---');
+  console.log(`Kết nối: ${safeUri}`);
+  if (only) console.log(`CHẾ ĐỘ --only: chỉ xử lý ${only.join(', ')}.`);
+  if (isFresh) {
+    console.log(only
+      ? `CHẾ ĐỘ --fresh: dữ liệu trong ${only.length} collection trên sẽ bị xóa.`
+      : 'CHẾ ĐỘ --fresh: toàn bộ dữ liệu trong 19 collection sẽ bị xóa.');
+  }
+
+  const db = await connectMongo();
+
+  // 1. Schema: collection + $jsonSchema validator + index
+  console.log('\n-> Áp schema (collection / validator / index)');
+  const schemaResult = await syncSchema(db, { drop: isFresh, verbose, only });
+
+  // 2. Dữ liệu mẫu
+  let seedResult = null;
+  if (shouldSeed) {
+    console.log('\n-> Nạp dữ liệu mẫu');
+    seedResult = await seed(db, { replace: false, verbose, only });
+  }
+
+  // 3. Tổng kết: đếm thực tế trong DB
+  console.log('\n=== TRẠNG THÁI DATABASE ===');
+  const rows = [];
+  for (const name of COLLECTION_NAMES) {
+    const count = await db.collection(name).countDocuments();
+    const indexes = await db.collection(name).indexes();
+    rows.push({ name, count, indexes: indexes.length });
+  }
+  const width = Math.max(...rows.map((r) => r.name.length));
+  for (const r of rows) {
+    console.log(`  ${r.name.padEnd(width)}  ${String(r.count).padStart(5)} doc   ${r.indexes} index`);
+  }
+
+  const totalDocs = rows.reduce((n, r) => n + r.count, 0);
+  console.log(
+    `\n✔ XONG: ${schemaResult.collections} collection, ${totalDocs} document, `
+    + `${rows.reduce((n, r) => n + r.indexes, 0)} index (gồm _id).`,
+  );
+  if (seedResult && seedResult.skipped.length > 0) {
+    console.log(
+      `  Lưu ý: ${seedResult.skipped.length} collection đã có dữ liệu nên bị bỏ qua. `
+      + 'Dùng --fresh nếu muốn nạp lại từ đầu.',
+    );
+  }
+}
+
+main()
+  .catch((err) => {
+    console.error('\n❌ Migration thất bại:', err.message);
+    if (err.code === 121) {
+      console.error('   (lỗi 121: document không qua được validator — đối chiếu db/seed.js với db/schema.js)');
+    }
+    if (err.name === 'MongoServerSelectionError') {
+      console.error('   Không kết nối được MongoDB. Đã chạy `docker compose up -d` chưa?');
+    }
+    if (process.env.DEBUG) console.error(err);
+    // Bản MySQL cũ chỉ log lỗi rồi vẫn exit 0, khiến npm báo thành công khi đã fail.
+    process.exitCode = 1;
+  })
+  .finally(async () => {
+    await closeMongo();
+  });

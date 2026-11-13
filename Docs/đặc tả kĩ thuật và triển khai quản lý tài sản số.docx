@@ -1,0 +1,182 @@
+Tài liệu này quy định kiến trúc dữ liệu, quy tắc nghiệp vụ và luồng xử lý End-to-End cho phân hệ Quản lý Tài sản trên nền tảng Vue 3 (Materio Vuetify) + Node.js/Express + TypeScript + MongoDB.1. Kiến trúc Thực thể & Mô hình Liên kếtHệ thống giải quyết bài toán liên kết giữa Thiết bị vật lý, Bản quyền phần mềm/Tài khoản số, và Nhân sự thông qua 3 thực thể cốt lõi:PhysicalAsset (Tài sản hữu hình): Laptop, PC, màn hình, điện thoại test. Có thể đi kèm sẵn bản quyền Windows OEM gắn chết theo phần cứng.DigitalAsset (Kho tài sản số): Gói thuê bao theo năm (M365), lô hộp bản quyền cứng (Windows/Office FPP), key điện tử (ESD), key doanh nghiệp (MAK), và các tài khoản SaaS/Cloud.AssetAssignment (Phiếu cấp phát & Lịch sử sử dụng): Bảng trung gian ghi nhận toàn bộ vòng đời giao – nhận – thu hồi, hỗ trợ 2 chế độ gắn kết:Gắn theo Nhân sự (user-bound): Bản quyền đi theo con người (VD: Microsoft 365 Business Basic/Standard, GitHub, Figma). Nhân sự đổi máy tính thì bản quyền vẫn đi theo nhân sự đó.Gắn theo Thiết bị (device-bound): Bản quyền cài trên máy cụ thể (VD: Windows 11 Pro FPP/ESD, Office LTSC MAK). Nhân sự sử dụng bản quyền này gián tiếp thông qua việc được giao quản lý chiếc máy đó.2. Thiết kế Cơ sở dữ liệu (MongoDB / Mongoose Schema)2.1. Schema PhysicalAsset (Tài sản hữu hình)TypeScriptimport mongoose, { Schema } from 'mongoose';
+
+const physicalAssetSchema = new Schema({
+  assetCode: { type: String, required: true, unique: true }, // Mã nội bộ, VD: "LAP-2026-001"
+  serialNumber: { type: String, required: true, unique: true },
+  name: { type: String, required: true }, // VD: "Dell Latitude 5440"
+  category: { 
+    type: String, 
+    enum: ['laptop', 'pc', 'monitor', 'mobile_device', 'peripheral', 'network'], 
+    required: true 
+  },
+  specs: { type: String }, // VD: "Core i7-1365U / 16GB RAM / 512GB SSD"
+
+  // Bản quyền Windows OEM đi kèm sẵn theo máy (chết theo mainboard, không tách rời)
+  bundledOemLicense: {
+    hasOem: { type: Boolean, default: false },
+    osName: { type: String, default: '' }, // VD: "Windows 11 Pro OEM"
+    encryptedKey: { type: String, default: '' } // Mã hóa AES-256 (nếu trích xuất được key)
+  },
+
+  condition: { 
+    type: String, 
+    enum: ['new', 'good', 'needs_repair', 'broken', 'liquidated'], 
+    default: 'new' 
+  },
+  status: { 
+    type: String, 
+    enum: ['available', 'assigned', 'maintenance', 'lost', 'retired'], 
+    default: 'available' 
+  },
+
+  // Trạng thái nắm giữ hiện tại (để query nhanh trên bảng danh sách)
+  currentHolderId: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+  assignedAt: { type: Date, default: null },
+
+  purchaseDate: { type: Date },
+  warrantyExpiry: { type: Date },
+  cost: { type: Number, default: 0 },
+  note: { type: String }
+}, { timestamps: true });
+
+physicalAssetSchema.index({ status: 1, category: 1 });
+physicalAssetSchema.index({ currentHolderId: 1 });
+
+export const PhysicalAsset = mongoose.model('PhysicalAsset', physicalAssetSchema);
+2.2. Schema DigitalAsset (Kho tài sản số & Bản quyền)TypeScriptconst licenseKeyItemSchema = new Schema({
+  encryptedKey: { type: String, required: true }, // Chuỗi key 25 ký tự đã mã hóa AES-256
+  status: { 
+    type: String, 
+    enum: ['available', 'assigned', 'burned'], // 'burned' = key hỏng/không tái sử dụng được
+    default: 'available' 
+  },
+  assignedToAssignmentId: { type: Schema.Types.ObjectId, ref: 'AssetAssignment', default: null }
+});
+
+const digitalAssetSchema = new Schema({
+  // Phân cấp Cha - Con (VD: Microsoft 365 Tenant Cha -> Các gói Basic/Standard/Visio Con)
+  parentAssetId: { type: Schema.Types.ObjectId, ref: 'DigitalAsset', default: null },
+  isContainerOnly: { type: Boolean, default: false }, // True nếu chỉ là cổng quản trị tổng
+
+  name: { type: String, required: true }, // VD: "Microsoft 365 Business Basic", "Lô 10 hộp Win 11 Pro FPP"
+  provider: { type: String, required: true }, // VD: "Microsoft", "Figma", "AWS"
+
+  // Hình thức đóng gói & pháp lý thực tế
+  packagingType: { 
+    type: String, 
+    enum: [
+      'cloud_subscription', // Thuê bao theo năm/tháng (M365 Basic/Standard, SaaS)
+      'physical_box_fpp',   // Bản cứng đóng hộp FPP (chuyển máy được, cần lưu kho vỏ hộp)
+      'digital_esd',        // Bản điện tử ESD gửi qua email (chuyển máy được)
+      'volume_portal',      // Bản doanh nghiệp MAK (1 key dùng cho N máy)
+      'shared_account'      // Tài khoản dùng chung (Apple ID, Freepik...)
+    ], 
+    required: true 
+  },
+
+  // Cơ chế cấp phát kỹ thuật
+  fulfillmentMethod: { 
+    type: String, 
+    enum: ['tenant_seat', 'mak_volume_key', 'discrete_key_pool', 'shared_account'], 
+    required: true 
+  },
+
+  // Đối tượng gắn kết: Gắn theo Người (M365) hay gắn theo Máy tính (Windows/Office cài máy)
+  bindingTarget: { 
+    type: String, 
+    enum: ['user', 'device'], 
+    required: true 
+  },
+
+  // Quy tắc thu hồi: True = Thu hồi xong trả seat/key về kho dùng lại; False = Không hoàn lại
+  isKeyReusable: { type: Boolean, default: true },
+
+  totalSeats: { type: Number, default: 1 }, // null nếu shared_account không giới hạn người dùng
+  usedSeats: { type: Number, default: 0 },
+
+  // Thông tin đăng nhập / Key dùng chung (Cho tenant_seat portal, shared_account, hoặc mak_volume_key)
+  loginIdentifier: { type: String },
+  encryptedSecret: { type: String }, // Password chung HOẶC chuỗi MAK Key dùng chung
+
+  // Danh sách key rời (Dành riêng cho discrete_key_pool: FPP Box, ESD)
+  keyPool: [licenseKeyItemSchema],
+
+  // Vị trí lưu kho vật lý (Bắt buộc nếu packagingType === 'physical_box_fpp')
+  physicalStorageLocation: { type: String, default: '' }, // VD: "Tủ IT - Ngăn B2"
+
+  // Quản trị, Bảo mật & Tài chính
+  recoveryEmail: { type: String },
+  has2FA: { type: Boolean, default: false },
+  twoFactorNote: { type: String },
+  requiresPasswordRotation: { type: Boolean, default: false }, // Bật cờ đỏ khi thu hồi user khỏi shared_account
+
+  cost: { type: Number, default: 0 },
+  currency: { type: String, enum: ['VND', 'USD'], default: 'VND' },
+  billingCycle: { type: String, enum: ['monthly', 'yearly', 'one_time'], default: 'yearly' },
+  expiryDate: { type: Date },
+  autoRenew: { type: Boolean, default: false },
+
+  status: { 
+    type: String, 
+    enum: ['available', 'fully_assigned', 'suspended', 'expired', 'archived'], 
+    default: 'available' 
+  },
+  ownerId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  note: { type: String }
+}, { timestamps: true });
+
+digitalAssetSchema.index({ parentAssetId: 1, status: 1 });
+digitalAssetSchema.index({ expiryDate: 1, status: 1 });
+
+export const DigitalAsset = mongoose.model('DigitalAsset', digitalAssetSchema);
+2.3. Schema AssetAssignment (Phiếu cấp phát & Lịch sử luân chuyển)TypeScriptconst assetAssignmentSchema = new Schema({
+  // Phân loại phiếu cấp phát
+  assignmentType: { 
+    type: String, 
+    enum: [
+      'physical_handover',      // Bàn giao thiết bị vật lý (Laptop/PC...)
+      'digital_user_license',   // Cấp bản quyền/tài khoản theo Nhân sự (M365, SaaS)
+      'digital_device_license'  // Cấp key bản quyền cài lên Thiết bị (Win FPP/ESD/MAK)
+    ], 
+    required: true 
+  },
+
+  // Nhân sự liên quan (Người nhận máy hoặc người nhận bản quyền)
+  employeeId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+
+  // Tham chiếu tài sản (Tùy theo assignmentType)
+  physicalAssetId: { type: Schema.Types.ObjectId, ref: 'PhysicalAsset', default: null },
+  digitalAssetId: { type: Schema.Types.ObjectId, ref: 'DigitalAsset', default: null },
+
+  // Dữ liệu cấp phát chi tiết cho Digital Asset
+  allocatedKeyId: { type: Schema.Types.ObjectId, default: null }, // ID của key trong keyPool (nếu FPP/ESD)
+  assignedIdentifier: { type: String }, // Email công ty được gán seat (nếu M365 tenant_seat)
+  accessScope: { type: String, default: 'User' }, // VD: "Global Admin", "Editor", "Device License"
+
+  // Vòng đời trạng thái của lượt cấp phát
+  status: { 
+    type: String, 
+    enum: ['pending_activation', 'active', 'suspended', 'revoked'], 
+    default: 'active' 
+  },
+
+  // Audit Log Bàn giao & Thu hồi
+  assignedBy: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  assignedAt: { type: Date, default: Date.now },
+  activatedAt: { type: Date },
+  handoverConditionNote: { type: String }, // Tình trạng máy khi giao (VD: "Máy mới 100%, kèm sạc zin")
+
+  revokedBy: { type: Schema.Types.ObjectId, ref: 'User' },
+  revokedAt: { type: Date },
+  revokeReason: { type: String }, // VD: "Offboarding", "Đổi máy mới", "Hỏng mainboard"
+  returnConditionNote: { type: String }, // Tình trạng máy khi thu hồi
+
+  note: { type: String }
+}, { timestamps: true });
+
+assetAssignmentSchema.index({ employeeId: 1, status: 1 });
+assetAssignmentSchema.index({ physicalAssetId: 1, status: 1 });
+assetAssignmentSchema.index({ digitalAssetId: 1, status: 1 });
+
+export const AssetAssignment = mongoose.model('AssetAssignment', assetAssignmentSchema);
+3. Ma trận Trạng thái & Quy tắc Nghiệp vụ (Business Rules)3.1. Ma trận Trạng thái 3 TầngThực thểTrạng thái (status)Ý nghĩa & Hành động hệ thống cho phépPhysicalAssetavailable → assigned → maintenance → retiredChỉ cấp phát được khi available. Khi bàn giao chuyển thành assigned và cập nhật currentHolderId.DigitalAssetavailable → fully_assigned → suspended / expired → archivedTự động chuyển fully_assigned khi usedSeats === totalSeats. Mở lại available khi có lượt thu hồi hoàn seat.AssetAssignmentpending_activation → active → suspended → revokedpending_activation dùng cho M365/SaaS chờ user accept invite. suspended giữ nguyên seat khi nhân sự nghỉ dài hạn. revoked kết thúc lượt cấp phát.3.2. 6 Quy tắc Nghiệp vụ Cốt lõiQuy tắc Windows OEM đi theo máy:Nếu PhysicalAsset có bundledOemLicense.hasOem = true, bản quyền Windows này gắn liền với chiếc máy đó suốt vòng đời. Khi bàn giao máy cho nhân sự A rồi sau này thu hồi giao lại cho nhân sự B, hệ thống tự động hiển thị thông tin Windows OEM trên hồ sơ thiết bị của người đang cầm máy mà không làm thay đổi số lượng kho DigitalAsset.Quy tắc Cấp Key FPP / ESD / MAK lên Thiết bị (bindingTarget: 'device'):Khi cấp key Windows/Office cài đặt lên máy tính, phiếu AssetAssignment bắt buộc liên kết đồng thời physicalAssetId (máy đích) và employeeId (người đang sử dụng máy).Nếu nhân sự trả máy về kho nhưng chiếc máy đó không cài lại Win mà giao nguyên trạng cho nhân sự mới: Chỉ thu hồi phiếu physical_handover của người cũ và tạo phiếu physical_handover cho người mới; phiếu digital_device_license trên máy đó được cập nhật employeeId sang người giữ máy mới (giữ nguyên key đã kích hoạt trên máy).Chỉ thu hồi (revoke) key FPP/ESD khỏi máy khi máy đó thanh lý (retired), hỏng mainboard, hoặc format gỡ bản quyền để chuyển key sang máy khác.Quy tắc Bản quyền theo Nhân sự (bindingTarget: 'user'):Các gói M365 Basic/Standard, SaaS gắn trực tiếp với employeeId. Khi nhân sự đổi từ Laptop cũ sang Laptop mới, các bản quyền này không bị ảnh hưởng.Quy tắc Bảo mật Tài khoản dùng chung (shared_account):Khi thu hồi bất kỳ nhân sự nào khỏi một tài khoản dùng chung, hệ thống tự động bật requiresPasswordRotation = true trên DigitalAsset và gửi cảnh báo đỏ cho IT Admin yêu cầu đổi mật khẩu gốc ngay lập tức.Quy tắc Toàn vẹn Dữ liệu (MongoDB Transaction):Mọi thao tác Assign/Revoke đều thực thi trong một Transaction: Cập nhật AssetAssignment, tăng/giảm usedSeats, cập nhật trạng thái phần tử trong keyPool, và tính lại status của tài sản gốc diễn ra đồng thời (tất cả thành công hoặc rollback toàn bộ).Quy tắc Bất biến Lịch sử (Immutable Audit Trail):Tuyệt đối không xóa bản ghi AssetAssignment hoặc ghi đè người nhận mới lên phiếu đã kết thúc. Mọi thao tác Re-assign đều phải thực hiện theo chuỗi: Revoke phiếu cũ → Tạo phiếu Assign mới.4. Chi tiết 6 Luồng Nghiệp vụ End-to-EndLuồng 1: Nhập kho Tài sản (Hữu hình & Số)Nhập Thiết bị vật lý: IT nhập mã tài sản, Serial Number, cấu hình. Nếu máy có sẵn Windows OEM, tick chọn "Kèm Windows OEM" và nhập tên phiên bản/key → Lưu PhysicalAsset (status: 'available').Nhập Gói Microsoft 365 (Theo năm): Tạo Tenant Cha (isContainerOnly: true) → Tạo gói con M365 Basic/Standard (packagingType: 'cloud_subscription', fulfillmentMethod: 'tenant_seat', bindingTarget: 'user', totalSeats: N, expiryDate).Nhập Lô Key Windows/Office (FPP / ESD / MAK):Nếu là FPP Box: Chọn packagingType: 'physical_box_fpp', nhập physicalStorageLocation (VD: "Tủ IT - Ngăn B2"), nhập danh sách N chuỗi key → Backend mã hóa AES-256 từng key đưa vào mảng keyPool.Nếu là MAK Volume Key: Chọn packagingType: 'volume_portal', fulfillmentMethod: 'mak_volume_key', nhập 1 chuỗi key duy nhất và totalSeats (số lượt kích hoạt tối đa).Luồng 2: Onboarding — Bàn giao Combo cho Nhân sự mớiIT thực hiện thao tác "Cấp phát trọn gói (Handover Bundle)" trên 1 màn hình duy nhất cho nhân sự mới:Chọn 1 Laptop đang available → Tạo phiếu physical_handover, đổi máy sang assigned.(Nếu máy chưa có Windows OEM) Chọn cấp 1 key từ kho Windows 11 Pro FPP/ESD → Hệ thống tự lấy 1 key available trong keyPool, tạo phiếu digital_device_license gắn với cả employeeId và physicalAssetId, tăng usedSeats + 1.Chọn cấp 1 seat Microsoft 365 Business Basic → Tạo phiếu digital_user_license ở trạng thái pending_activation, gửi tin nhắn qua module Chat nội bộ kèm thông tin tài khoản/key để nhân sự kích hoạt.Nhân sự đăng nhập Dashboard, kiểm tra thông tin và bấm "Xác nhận đã nhận & kích hoạt" → Các phiếu chuyển sang active.Luồng 3: Đổi máy / Sửa chữa thiết bị (Device Swap)Khi nhân sự đang dùng Laptop A (có cài Win FPP) bị hỏng cần đổi sang Laptop B:Thu hồi (revoke) phiếu physical_handover của Laptop A với lý do "Bảo hành/Sửa chữa", chuyển Laptop A sang maintenance.(Tùy chọn trên UI) Nếu Laptop A hỏng nặng phải cài lại máy/thanh lý: IT tick chọn "Thu hồi luôn key Windows FPP trên Laptop A" → Key FPP được giải phóng về kho (available) để cài cho Laptop B.Bàn giao Laptop B cho nhân sự. Toàn bộ bản quyền M365 (user-bound) của nhân sự được giữ nguyên không cần thao tác lại.Luồng 4: Offboarding — Thu hồi toàn diện khi Nhân sự nghỉ việcKhi HR/Admin kích hoạt quy trình Offboarding cho một nhân sự, hệ thống quét toàn bộ AssetAssignment có status là active, pending_activation, hoặc suspended của nhân sự đó và hiển thị danh sách phân loại rõ ràng:Nhóm Tài sản Hữu hình (Laptop, Màn hình...): IT xác nhận đã nhận lại thiết bị vật lý, ghi chú tình trạng máy (returnConditionNote) → Chuyển PhysicalAsset về available (hoặc maintenance).Nhóm Bản quyền gắn trên Máy (digital_device_license):Lựa chọn A (Giữ bản quyền trên máy cho người sau): Hệ thống giữ nguyên key trên máy, gỡ liên kết khỏi nhân sự nghỉ việc (employeeId: null hoặc chờ gán người kế nhiệm).Lựa chọn B (Format máy / Thu hồi key về kho): Revoke phiếu cấp phát, hoàn lại key vào keyPool (available).Nhóm Bản quyền theo Nhân sự (digital_user_license - M365, SaaS): Revoke toàn bộ → Giải phóng seat về kho ngay lập tức để IT vào Admin Center của hãng cắt quyền truy cập.Cảnh báo Tài khoản dùng chung: Nếu nhân sự có nắm giữ shared_account, hệ thống khóa nút hoàn tất Offboarding cho đến khi IT xác nhận đã đổi mật khẩu mới.Luồng 5: Tái cấp phát (Re-assign)Khi có nhân sự mới thay thế vị trí, IT thực hiện Luồng 2 từ kho tài sản available. Lịch sử ai đã cầm chiếc Laptop hay chuỗi key FPP đó trong quá khứ vẫn được lưu nguyên vẹn trong AssetAssignment phục vụ kiểm toán (Audit).Luồng 6: Giám sát tự động (Cronjob định kỳ 08:00 sáng hằng ngày)Quét DigitalAsset có expiryDate còn 30 ngày / 7 ngày → Bắn thông báo vào nhóm Chat IT và ownerId.Quét DigitalAsset đã quá expiryDate (và autoRenew: false) → Chuyển trạng thái sang expired.Quét AssetAssignment ở trạng thái pending_activation quá 3 ngày → Gửi tin nhắn nhắc nhở nhân sự hoàn tất kích hoạt.5. Thiết kế API Endpoints & Giao diện Materio (Vuetify 3)5.1. Danh sách API Endpoints chính (RESTful)MethodEndpointChức năngPOST/api/assets/physicalTạo mới thiết bị vật lý (kèm cấu hình Windows OEM nếu có).POST/api/assets/digitalTạo mới tài sản số / Lô key FPP, ESD, MAK / Gói M365.GET/api/assets/digital/:id/reveal-secretGiải mã AES-256 và trả về Key/Password (có ghi log ai đã xem).POST/api/assignments/handover-bundleCấp phát trọn gói (Thiết bị + Key theo máy + License theo người) trong 1 Transaction.PATCH/api/assignments/:id/confirm-activationNhân sự xác nhận đã nhận tài sản & kích hoạt thành công (active).POST/api/assignments/:id/revokeThu hồi đơn lẻ 1 thiết bị hoặc 1 bản quyền (kèm tùy chọn hoàn key về kho).GET/api/employees/:id/offboarding-summaryLấy danh sách toàn bộ tài sản hữu hình & số nhân sự đang giữ để xử lý Offboarding.POST/api/employees/:id/offboard-executeThực thi thu hồi hàng loạt khi nhân sự nghỉ việc.5.2. Bố cục Giao diện trên Materio Admin TemplateTrang Quản lý Tài sản (3 Tabs trên Vuetify VTabs):Tab 1 — Thiết bị Vật lý: VDataTable hiển thị Mã máy, Tên thiết bị, Badge "Kèm Win OEM" (nếu có), Người đang giữ, Trạng thái, nút thao tác nhanh (Bàn giao / Thu hồi / Lịch sử).Tab 2 — Bản quyền & Tài khoản Số: Hiển thị dạng bảng phân cấp (nhóm theo Provider/Tenant Cha), thanh tiến độ sử dụng Seat (VProgressLinear: VD 14/20 seats), Badge loại gói (M365 Năm, FPP Hộp cứng, ESD, MAK), cảnh báo ngày hết hạn.Tab 3 — Tra cứu theo Nhân sự: Chọn 1 nhân viên để xem toàn cảnh người đó đang cầm những thiết bị vật lý nào và bao nhiêu tài khoản/license số, kèm tổng chi phí bản quyền hằng tháng của nhân sự đó.Drawer Cấp phát Trọn gói (VNavigationDrawer): Cho phép IT chọn Nhân viên → Chọn Laptop → Hệ thống tự kiểm tra nếu Laptop chưa có Windows OEM thì gợi ý ngay danh sách Key Windows FPP/ESD đang trống trong kho để cấp kèm trong 1 lần bấm.Modal Xem Key Bảo mật: Khi nhân sự hoặc IT bấm "Xem Key / Mật khẩu", hiển thị dialog yêu cầu xác nhận, gọi API giải mã và cung cấp nút Copy to Clipboard (tự động ẩn key sau 30 giây).

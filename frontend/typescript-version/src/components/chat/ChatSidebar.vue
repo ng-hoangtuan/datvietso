@@ -6,6 +6,36 @@ const emit = defineEmits<{
 }>()
 
 const store = useChatStore()
+
+/**
+ * Dòng xem trước dưới tên phòng.
+ *
+ * `lastMessage` là snapshot do server tính sẵn (conversations.lastMessage) nên có
+ * sẵn senderId/senderName — không phải đi đọc collection messages để biết ai gửi.
+ */
+const preview = (room: ChatRoom) => {
+  const lm = room.lastMessage
+  if (!lm) return 'Chưa có tin nhắn'
+
+  const body = lm.type === 'media'
+    ? '[Tệp đính kèm]'
+    : lm.type === 'location'
+      ? '[Vị trí]'
+      : lm.content
+
+  // Tin hệ thống đứng một mình, không gắn tên người gửi
+  if (lm.type === 'system' || lm.senderId === 'system') return body
+
+  if (String(lm.senderId) === String(store.currentUser.userId)) return `Bạn: ${body}`
+
+  // Chat 1-1 thì tên phòng đã là tên người kia, thêm tên nữa chỉ gây rối
+  return room.isGroup && lm.senderName ? `${lm.senderName}: ${body}` : body
+}
+
+const partnerId = (room: ChatRoom) =>
+  room.partnerId
+  || room.members.find(m => String(m.userId) !== String(store.currentUser.userId))?.userId
+  || ''
 </script>
 
 <template>
@@ -35,6 +65,16 @@ const store = useChatStore()
             />
           </template>
         </v-tooltip>
+      </div>
+
+      <!-- Trạng thái kết nối realtime: mất socket thì tin nhắn không gửi được,
+           người dùng cần biết ngay thay vì gõ xong mới thấy lỗi -->
+      <div
+        v-if="!store.isConnected"
+        class="d-flex align-center gap-1 text-caption text-warning font-weight-medium"
+      >
+        <v-icon icon="ri-wifi-off-line" size="14" />
+        Đang kết nối lại tới server chat...
       </div>
     </div>
 
@@ -113,7 +153,7 @@ const store = useChatStore()
         <v-list-item
           v-for="room in store.sortedAndFilteredRooms"
           :key="room.id"
-          :active="store.activeRoomId === room.id"
+          :active="String(store.activeRoomId) === String(room.id)"
           active-color="primary"
           class="py-3 px-3 border-b cursor-pointer transition-all room-item"
           @click="store.selectRoom(room.id)"
@@ -129,7 +169,7 @@ const store = useChatStore()
               <span
                 v-if="!room.isGroup"
                 class="status-indicator"
-                :class="store.isUserOnline(room.members.find(m => String(m.userId) !== String(store.currentUser.userId))?.userId || '') ? 'online' : 'offline'"
+                :class="store.isUserOnline(partnerId(room)) ? 'online' : 'offline'"
               />
 
               <!-- Nếu là Group Chat: hiển thị icon nhóm nhỏ ở góc -->
@@ -157,14 +197,18 @@ const store = useChatStore()
             </span>
           </v-list-item-title>
 
-          <!-- Tin nhắn gần nhất & Badge chưa đọc -->
+          <!-- Tin nhắn gần nhất & Badge chưa đọc / được nhắc tên -->
           <v-list-item-subtitle class="d-flex justify-space-between align-center mt-1">
-            <span class="text-truncate text-caption text-medium-emphasis" style="max-width: 170px;">
-              {{ room.lastMessage?.content || 'Chưa có tin nhắn' }}
+            <span
+              class="text-truncate text-caption"
+              :class="room.unreadCount > 0 ? 'font-weight-bold text-high-emphasis' : 'text-medium-emphasis'"
+              style="max-width: 160px;"
+            >
+              {{ preview(room) }}
             </span>
 
             <div class="d-flex align-center gap-1">
-              <!-- Nút toggle Pin nhanh khi hover -->
+              <!-- Nút toggle Pin nhanh khi hover (Task 2.3) -->
               <v-btn
                 icon
                 size="x-small"
@@ -176,14 +220,29 @@ const store = useChatStore()
                 <v-icon :icon="room.isPinned ? 'ri-pushpin-2-fill' : 'ri-pushpin-line'" size="14" />
               </v-btn>
 
-              <!-- Số tin chưa đọc -->
+              <!-- Badge có người nhắc tên mình (Task 4.1) — đứng trước số chưa đọc -->
+              <v-tooltip :text="`${room.mentionCount} tin nhắc đến bạn`" location="left">
+                <template #activator="{ props: tipProps }">
+                  <v-chip
+                    v-if="room.mentionCount > 0"
+                    v-bind="tipProps"
+                    color="warning"
+                    size="x-small"
+                    class="font-weight-bold px-1"
+                  >
+                    @{{ room.mentionCount }}
+                  </v-chip>
+                </template>
+              </v-tooltip>
+
+              <!-- Số tin chưa đọc (bền qua F5: lastReadAt lưu trong DB) -->
               <v-chip
                 v-if="room.unreadCount > 0"
                 color="error"
                 size="x-small"
                 class="font-weight-bold"
               >
-                {{ room.unreadCount }}
+                {{ room.unreadCount > 99 ? '99+' : room.unreadCount }}
               </v-chip>
             </div>
           </v-list-item-subtitle>

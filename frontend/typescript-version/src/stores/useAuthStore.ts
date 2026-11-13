@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { useChatStore } from './useChatStore'
+import { API_BASE } from '@/utils/api'
 
 export interface AuthUser {
   id: string
@@ -27,7 +28,7 @@ export interface DemoAccount {
   defaultPassword: string
 }
 
-const API_AUTH = 'http://localhost:5000/api/auth'
+const API_AUTH = `${API_BASE}/api/auth`
 
 export const useAuthStore = defineStore('auth', () => {
   const router = useRouter()
@@ -43,6 +44,27 @@ export const useAuthStore = defineStore('auth', () => {
   const errorMessage = ref('')
 
   const isAuthenticated = computed(() => !!token.value && !!user.value)
+
+  /**
+   * Bản dùng thử cho khách (DEMO_MODE ở backend). Khi bật thì trang đăng nhập
+   * giấu hết gợi ý tài khoản mẫu và mật khẩu mặc định — đưa link ra Internet mà
+   * vẫn in sẵn mật khẩu lên màn hình thì coi như không khoá gì.
+   */
+  const isDemoMode = ref(false)
+
+  async function loadConfig() {
+    try {
+      const res = await fetch(`${API_BASE}/api/config`)
+      if (res.ok) {
+        const cfg = await res.json()
+        isDemoMode.value = !!cfg.demoMode
+        if (isDemoMode.value) demoAccounts.value = []
+      }
+    }
+    catch (e) {
+      // Không gọi được thì cứ coi như bản nội bộ, giữ nguyên hành vi cũ
+    }
+  }
 
   // Danh sách tài khoản mẫu để test nhanh
   const demoAccounts = ref<DemoAccount[]>([
@@ -159,6 +181,8 @@ export const useAuthStore = defineStore('auth', () => {
     errorMessage,
     isAuthenticated,
     demoAccounts,
+    isDemoMode,
+    loadConfig,
     login,
     logout,
   }

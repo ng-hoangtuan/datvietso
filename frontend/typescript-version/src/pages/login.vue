@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { useTheme } from 'vuetify'
 import { useAuthStore, type DemoAccount } from '@/stores/useAuthStore'
@@ -18,6 +18,24 @@ const form = ref({
   employee_code: 'DVS-001',
   password: '123456',
   remember: true,
+})
+
+// Bản dùng thử: xoá sạch thông tin điền sẵn và giấu mọi gợi ý mật khẩu.
+// Nếu không, link gửi cho khách vẫn in mật khẩu ngay trên màn hình đăng nhập.
+const formRef = ref<any>(null)
+
+onMounted(async () => {
+  await authStore.loadConfig()
+  if (!authStore.isDemoMode) return
+
+  form.value.employee_code = ''
+  form.value.password = ''
+
+  // Xoá giá trị làm Vuetify coi như người dùng đã sửa rồi bỏ trống, nên hiện
+  // ngay hai dòng đỏ lúc mới mở trang. resetValidation() đưa form về trạng thái
+  // chưa chạm — khách thấy form sạch thay vì tưởng hệ thống lỗi.
+  await nextTick()
+  formRef.value?.resetValidation?.()
 })
 
 const isPasswordVisible = ref(false)
@@ -97,7 +115,7 @@ const handleLogin = async () => {
       </div>
 
       <VCardText>
-        <VForm @submit.prevent="handleLogin">
+        <VForm ref="formRef" @submit.prevent="handleLogin">
           <VRow>
             <!-- Mã nhân sự (employee_code) -->
             <VCol cols="12">
@@ -139,6 +157,7 @@ const handleLogin = async () => {
                 />
 
                 <a
+                  v-if="!authStore.isDemoMode"
                   class="text-primary text-caption font-weight-medium"
                   href="javascript:void(0)"
                 >
@@ -160,8 +179,9 @@ const handleLogin = async () => {
               </VBtn>
             </VCol>
 
-            <!-- Gợi ý tài khoản demo bấm chọn nhanh -->
-            <VCol cols="12" class="pt-4">
+            <!-- Gợi ý tài khoản demo bấm chọn nhanh. Ẩn hẳn ở bản dùng thử:
+                 khối này in cả mã nhân sự lẫn mật khẩu ra màn hình. -->
+            <VCol v-if="!authStore.isDemoMode && authStore.demoAccounts.length" cols="12" class="pt-4">
               <div class="text-caption font-weight-bold text-medium-emphasis mb-2 text-center">
                 CHỌN TÀI KHOẢN MẪU ĐỂ ĐĂNG NHẬP NHANH (Pass: 123456)
               </div>

@@ -1,8 +1,24 @@
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, onMounted } from 'vue'
 import { useChatStore, type GroupRole } from '@/stores/useChatStore'
+import { vnAutocompleteFilter } from '@/utils/vnSearch'
 
 const store = useChatStore()
+
+/**
+ * Bộ sưu tập (Task 3.2) lấy từ GET /conversations/:id/attachments.
+ *
+ * Bản cũ lọc từ `store.activeMessages` — tức là chỉ trong những tin ĐANG nằm
+ * trong bộ nhớ. Từ khi lịch sử tin nhắn được phân trang (50 tin/lần), cách đó chỉ
+ * thấy đính kèm của vài chục tin gần nhất. Giờ đọc thẳng DB qua `attachmentKind`
+ * đã tính sẵn lúc ghi, nên panel luôn đủ cả phòng.
+ */
+const refreshAttachments = () => {
+  if (store.activeRoomId) store.fetchAttachments(store.activeRoomId)
+}
+
+onMounted(refreshAttachments)
+watch(() => store.activeRoomId, refreshAttachments)
 
 // Các mục đang mở (dạng sổ xuống giống Zalo, có thể mở nhiều mục cùng lúc)
 type SectionKey = 'members' | 'media' | 'files' | 'links'
@@ -29,30 +45,19 @@ watch(() => store.activeRoomId, () => {
   showAllMedia.value = false
 })
 
-// Lọc các tin nhắn media/files/links trong phòng hiện tại
-const sharedMedia = computed(() => {
-  return store.activeMessages.filter(m =>
-    !m.isDeleted && m.type === 'media'
-    && (m.metadata?.mimetype?.startsWith('image/') || m.metadata?.mimetype?.startsWith('video/')),
-  )
-})
+// Phân loại do server tính sẵn: image / video / file / link
+const sharedMedia = computed(() =>
+  store.attachments.filter(a => a.kind === 'image' || a.kind === 'video'))
 
-const visibleMedia = computed(() => {
-  return showAllMedia.value ? sharedMedia.value : sharedMedia.value.slice(0, MEDIA_PREVIEW_LIMIT)
-})
+const visibleMedia = computed(() =>
+  (showAllMedia.value ? sharedMedia.value : sharedMedia.value.slice(0, MEDIA_PREVIEW_LIMIT)))
 
-const sharedFiles = computed(() => {
-  return store.activeMessages.filter(m =>
-    !m.isDeleted && m.type === 'media'
-    && !m.metadata?.mimetype?.startsWith('image/') && !m.metadata?.mimetype?.startsWith('video/'),
-  )
-})
+const sharedFiles = computed(() => store.attachments.filter(a => a.kind === 'file'))
 
-const sharedLinks = computed(() => {
-  return store.activeMessages.filter(m =>
-    !m.isDeleted && (m.type === 'location' || (m.type === 'text' && (m.content.includes('http://') || m.content.includes('https://')))),
-  )
-})
+const sharedLinks = computed(() => store.attachments.filter(a => a.kind === 'link'))
+
+/** Số đếm toàn phòng (không phụ thuộc số item đang tải về). */
+const mediaCount = computed(() => store.attachmentCounts.image + store.attachmentCounts.video)
 
 // Danh sách contact chưa có trong nhóm
 const availableContactsToAdd = computed(() => {
@@ -60,14 +65,80 @@ const availableContactsToAdd = computed(() => {
   return store.contactList.filter(c => !currentMemberIds.has(String(c.userId)))
 })
 
+/** Bọc mọi lời gọi store có thể ném lỗi, để lỗi hiện ra thay vì rơi im lặng. */
+const run = async (fn: () => Promise<any>) => {
+  try {
+    await fn()
+  }
+  catch (e: any) {
+    store.lastError = e?.message || 'Thao tác không thành công'
+  }
+}
+
 // Xử lý thêm thành viên mới
-const handleAddMembers = () => {
+const handleAddMembers = async () => {
   if (selectedNewMemberIds.value.length === 0) return
 
   const toAdd = store.contactList.filter(c => selectedNewMemberIds.value.includes(c.userId))
-  store.addMembersToCurrentGroup(toAdd)
+  await run(() => store.addMembersToCurrentGroup(toAdd))
   selectedNewMemberIds.value = []
   isAddMemberDialogOpen.value = false
+}
+
+// --- Đổi tên nhóm / ảnh đại diện (Task 1.4: owner + admin) ------------------
+const isEditGroupOpen = ref(false)
+const editName = ref('')
+const editAvatar = ref('')
+const savingGroup = ref(false)
+
+const AVATAR_PRESETS = [
+  'https://api.dicebear.com/7.x/identicon/svg?seed=DatVietSo',
+  'https://api.dicebear.com/7.x/identicon/svg?seed=ChatRealtime',
+  'https://api.dicebear.com/7.x/identicon/svg?seed=KinhDoanh',
+  'https://api.dicebear.com/7.x/identicon/svg?seed=KyThuat',
+  'https://api.dicebear.com/7.x/shapes/svg?seed=NhanSu',
+  'https://api.dicebear.com/7.x/shapes/svg?seed=DuAn',
+]
+
+const openEditGroup = () => {
+  editName.value = store.activeRoom.name
+  editAvatar.value = store.activeRoom.avatar
+  isEditGroupOpen.value = true
+}
+
+const saveGroupInfo = async () => {
+  if (!editName.value.trim()) {
+    store.lastError = 'Tên nhóm không được để trống!'
+
+    return
+  }
+
+  savingGroup.value = true
+  await run(() => store.updateGroupInfo({ name: editName.value.trim(), avatar: editAvatar.value }))
+  savingGroup.value = false
+  isEditGroupOpen.value = false
+}
+
+// --- Rời nhóm / xóa cuộc trò chuyện ----------------------------------------
+const confirmAction = ref<'leave' | 'delete' | null>(null)
+
+const confirmText = computed(() => {
+  if (confirmAction.value === 'leave') {
+    return isOwner.value
+      ? 'Bạn là Trưởng nhóm. Khi rời nhóm, quyền Trưởng nhóm sẽ được chuyển cho Phó nhóm (hoặc thành viên) vào nhóm sớm nhất.'
+      : 'Bạn sẽ không còn nhận tin nhắn của nhóm này nữa.'
+  }
+
+  return store.activeRoom.isGroup
+    ? 'Xóa nhóm sẽ xóa vĩnh viễn TOÀN BỘ tin nhắn của nhóm với mọi thành viên. Không thể hoàn tác.'
+    : 'Xóa cuộc trò chuyện sẽ xóa vĩnh viễn toàn bộ tin nhắn giữa hai người. Không thể hoàn tác.'
+})
+
+const doConfirmedAction = async () => {
+  const action = confirmAction.value
+  confirmAction.value = null
+  if (action === 'leave') await run(() => store.leaveCurrentGroup())
+  else if (action === 'delete') await run(() => store.deleteCurrentConversation())
 }
 
 // Quyền hạn hiện tại của tôi trong nhóm
@@ -123,6 +194,19 @@ const openUrl = (url?: string) => {
         <div v-if="store.activeRoom.isGroup" class="text-caption text-medium-emphasis">
           {{ store.activeRoom.members.length }} thành viên
         </div>
+
+        <!-- Đổi tên nhóm / ảnh đại diện — Task 1.4, chỉ Owner và Admin -->
+        <v-btn
+          v-if="store.activeRoom.isGroup && canManageMembers"
+          size="small"
+          variant="tonal"
+          color="primary"
+          class="mt-3 text-none"
+          prepend-icon="ri-edit-line"
+          @click="openEditGroup"
+        >
+          Đổi tên & ảnh nhóm
+        </v-btn>
       </div>
 
       <!-- ===== MỤC 1: THÀNH VIÊN NHÓM ===== -->
@@ -194,21 +278,21 @@ const openUrl = (url?: string) => {
                     v-if="member.role === 'member'"
                     prepend-icon="ri-shield-user-line"
                     title="Bổ nhiệm làm Phó nhóm"
-                    @click="store.changeMemberRole(member.userId, 'admin')"
+                    @click="run(() => store.changeMemberRole(member.userId, 'admin'))"
                   />
                   <!-- Miễn nhiệm phó nhóm -->
                   <v-list-item
                     v-if="member.role === 'admin'"
                     prepend-icon="ri-user-unfollow-line"
                     title="Miễn nhiệm Phó nhóm"
-                    @click="store.changeMemberRole(member.userId, 'member')"
+                    @click="run(() => store.changeMemberRole(member.userId, 'member'))"
                   />
                   <!-- Nhường quyền trưởng nhóm -->
                   <v-list-item
                     prepend-icon="ri-vip-crown-line"
                     title="Nhường quyền Trưởng nhóm"
                     class="text-warning"
-                    @click="store.changeMemberRole(member.userId, 'owner')"
+                    @click="run(() => store.changeMemberRole(member.userId, 'owner'))"
                   />
                   <v-divider class="my-1" />
                   <!-- Xóa khỏi nhóm -->
@@ -216,7 +300,7 @@ const openUrl = (url?: string) => {
                     prepend-icon="ri-delete-bin-line"
                     title="Xóa khỏi nhóm"
                     class="text-error"
-                    @click="store.removeMemberFromGroup(member.userId)"
+                    @click="run(() => store.removeMemberFromGroup(member.userId))"
                   />
                 </v-list>
               </v-menu>
@@ -230,7 +314,8 @@ const openUrl = (url?: string) => {
         <div class="section-header" @click="toggleSection('media')">
           <span class="section-title">Ảnh/Video</span>
           <span class="d-flex align-center gap-1">
-            <span class="text-caption text-medium-emphasis">{{ sharedMedia.length }}</span>
+            <v-progress-circular v-if="store.loadingAttachments" size="12" width="2" indeterminate />
+            <span class="text-caption text-medium-emphasis">{{ mediaCount }}</span>
             <v-icon :icon="openSections.media ? 'ri-arrow-up-s-line' : 'ri-arrow-down-s-line'" size="20" />
           </span>
         </div>
@@ -246,7 +331,7 @@ const openUrl = (url?: string) => {
                   @click="openUrl(m.metadata?.fileUrl)"
                 >
                   <img
-                    v-if="m.metadata?.mimetype?.startsWith('image/')"
+                    v-if="m.kind === 'image'"
                     :src="m.metadata?.fileUrl"
                     :alt="m.metadata?.filename"
                   >
@@ -282,7 +367,7 @@ const openUrl = (url?: string) => {
         <div class="section-header" @click="toggleSection('files')">
           <span class="section-title">File</span>
           <span class="d-flex align-center gap-1">
-            <span class="text-caption text-medium-emphasis">{{ sharedFiles.length }}</span>
+            <span class="text-caption text-medium-emphasis">{{ store.attachmentCounts.file }}</span>
             <v-icon :icon="openSections.files ? 'ri-arrow-up-s-line' : 'ri-arrow-down-s-line'" size="20" />
           </span>
         </div>
@@ -326,7 +411,7 @@ const openUrl = (url?: string) => {
         <div class="section-header" @click="toggleSection('links')">
           <span class="section-title">Link</span>
           <span class="d-flex align-center gap-1">
-            <span class="text-caption text-medium-emphasis">{{ sharedLinks.length }}</span>
+            <span class="text-caption text-medium-emphasis">{{ store.attachmentCounts.link }}</span>
             <v-icon :icon="openSections.links ? 'ri-arrow-up-s-line' : 'ri-arrow-down-s-line'" size="20" />
           </span>
         </div>
@@ -365,7 +450,112 @@ const openUrl = (url?: string) => {
           </div>
         </v-expand-transition>
       </div>
+
+      <!-- ===== MỤC 5: RỜI NHÓM / XÓA CUỘC TRÒ CHUYỆN ===== -->
+      <div class="pa-3 d-flex flex-column gap-2">
+        <v-btn
+          v-if="store.activeRoom.isGroup"
+          variant="tonal"
+          color="warning"
+          size="small"
+          block
+          class="text-none"
+          prepend-icon="ri-logout-box-r-line"
+          @click="confirmAction = 'leave'"
+        >
+          Rời nhóm
+        </v-btn>
+
+        <!-- Nhóm: chỉ Owner xóa được. Chat 1-1: ai trong cuộc cũng xóa được. -->
+        <v-btn
+          v-if="!store.activeRoom.isGroup || isOwner"
+          variant="tonal"
+          color="error"
+          size="small"
+          block
+          class="text-none"
+          prepend-icon="ri-delete-bin-line"
+          @click="confirmAction = 'delete'"
+        >
+          {{ store.activeRoom.isGroup ? 'Xóa nhóm & toàn bộ tin nhắn' : 'Xóa cuộc trò chuyện' }}
+        </v-btn>
+      </div>
     </div>
+
+    <!-- Dialog đổi tên nhóm / ảnh đại diện (Task 1.4) -->
+    <v-dialog v-model="isEditGroupOpen" max-width="460px">
+      <v-card class="rounded-lg">
+        <v-card-title class="px-5 pt-4 pb-2 text-h6 font-weight-bold">
+          Thông tin nhóm
+        </v-card-title>
+        <v-divider />
+        <v-card-text class="pa-4">
+          <v-text-field
+            v-model="editName"
+            label="Tên nhóm"
+            variant="outlined"
+            density="comfortable"
+            counter="80"
+            maxlength="80"
+            class="mb-4"
+          />
+
+          <div class="text-caption font-weight-medium mb-2">Ảnh đại diện nhóm</div>
+          <div class="d-flex flex-wrap gap-2 mb-3">
+            <v-avatar
+              v-for="url in AVATAR_PRESETS"
+              :key="url"
+              size="44"
+              class="cursor-pointer avatar-option"
+              :class="{ 'avatar-selected': editAvatar === url }"
+              @click="editAvatar = url"
+            >
+              <v-img :src="url" />
+            </v-avatar>
+          </div>
+          <v-text-field
+            v-model="editAvatar"
+            label="Hoặc dán URL ảnh"
+            variant="outlined"
+            density="compact"
+            hide-details
+          />
+        </v-card-text>
+        <v-divider />
+        <v-card-actions class="px-5 py-3 justify-end gap-2">
+          <v-btn variant="outlined" color="grey" @click="isEditGroupOpen = false">
+            Hủy
+          </v-btn>
+          <v-btn color="primary" :loading="savingGroup" @click="saveGroupInfo">
+            Lưu thay đổi
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <!-- Hỏi lại trước khi rời nhóm / xóa phòng: xóa phòng là cascade toàn bộ tin nhắn -->
+    <v-dialog :model-value="confirmAction !== null" max-width="430px" @update:model-value="confirmAction = null">
+      <v-card class="rounded-lg">
+        <v-card-title class="px-5 pt-4 pb-2 text-h6 font-weight-bold">
+          {{ confirmAction === 'leave' ? 'Rời nhóm?' : 'Xóa cuộc trò chuyện?' }}
+        </v-card-title>
+        <v-card-text class="px-5 text-body-2">
+          {{ confirmText }}
+        </v-card-text>
+        <v-card-actions class="px-5 py-3 justify-end gap-2">
+          <v-btn variant="outlined" color="grey" @click="confirmAction = null">
+            Hủy
+          </v-btn>
+          <v-btn
+            :color="confirmAction === 'leave' ? 'warning' : 'error'"
+            variant="flat"
+            @click="doConfirmedAction"
+          >
+            {{ confirmAction === 'leave' ? 'Rời nhóm' : 'Xóa vĩnh viễn' }}
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
 
     <!-- Dialog thêm thành viên mới vào nhóm -->
     <v-dialog v-model="isAddMemberDialogOpen" max-width="480px">
@@ -385,6 +575,7 @@ const openUrl = (url?: string) => {
             closable-chips
             label="Chọn nhân sự cần thêm"
             placeholder="Tìm kiếm theo tên..."
+            :custom-filter="vnAutocompleteFilter"
             variant="outlined"
             density="comfortable"
           >
@@ -527,6 +718,17 @@ const openUrl = (url?: string) => {
   border-radius: 50%;
   border: 1.5px solid rgb(var(--v-theme-surface));
 }
+.avatar-option {
+  border: 2px solid transparent;
+  transition: border-color 0.15s;
+}
+.avatar-option:hover {
+  border-color: rgba(115, 103, 240, 0.4);
+}
+.avatar-selected {
+  border-color: #7367f0;
+}
+
 .status-indicator-mini.online { background-color: #28c76f; }
 .status-indicator-mini.offline { background-color: #a8aaae; }
 </style>

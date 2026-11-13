@@ -7,12 +7,6 @@ export {}
 /* prettier-ignore */
 declare module 'vue' {
   export interface GlobalComponents {
-    AssetAllocationModal: typeof import('./src/components/assets/AssetAllocationModal.vue')['default']
-    AssetAuditCard: typeof import('./src/components/assets/AssetAuditCard.vue')['default']
-    AssetDetailModal: typeof import('./src/components/assets/AssetDetailModal.vue')['default']
-    AssetFilterBar: typeof import('./src/components/assets/AssetFilterBar.vue')['default']
-    AssetFormModal: typeof import('./src/components/assets/AssetFormModal.vue')['default']
-    AssetTable: typeof import('./src/components/assets/AssetTable.vue')['default']
     CardStatisticsHorizontal: typeof import('./src/@core/components/cards/CardStatisticsHorizontal.vue')['default']
     CardStatisticsVertical: typeof import('./src/@core/components/cards/CardStatisticsVertical.vue')['default']
     CardStatisticsWithImages: typeof import('./src/@core/components/cards/CardStatisticsWithImages.vue')['default']
@@ -20,8 +14,13 @@ declare module 'vue' {
     ChatLog: typeof import('./src/components/chat/ChatLog.vue')['default']
     ChatSidebar: typeof import('./src/components/chat/ChatSidebar.vue')['default']
     ChatUserProfileRight: typeof import('./src/components/chat/ChatUserProfileRight.vue')['default']
+    DigitalAssetTable: typeof import('./src/components/assets/DigitalAssetTable.vue')['default']
+    EmployeeAssetLookup: typeof import('./src/components/assets/EmployeeAssetLookup.vue')['default']
     ErrorHeader: typeof import('./src/components/ErrorHeader.vue')['default']
+    HandoverDrawer: typeof import('./src/components/assets/HandoverDrawer.vue')['default']
     MoreBtn: typeof import('./src/@core/components/MoreBtn.vue')['default']
+    PhysicalAssetTable: typeof import('./src/components/assets/PhysicalAssetTable.vue')['default']
+    RevealSecretDialog: typeof import('./src/components/assets/RevealSecretDialog.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']
     ThemeSwitcher: typeof import('./src/@core/components/ThemeSwitcher.vue')['default']
