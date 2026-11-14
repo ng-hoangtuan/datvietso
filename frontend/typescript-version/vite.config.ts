@@ -52,6 +52,11 @@ export default defineConfig({
       '@configured-variables': fileURLToPath(new URL('./src/assets/styles/variables/_template.scss', import.meta.url)),
     },
   },
+  server: {
+    host: '0.0.0.0',
+    port: 5173,
+    cors: true,
+  },
   build: {
     chunkSizeWarningLimit: 5000,
   },

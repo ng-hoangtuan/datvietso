@@ -466,8 +466,10 @@ async function start() {
         });
     }
 
-    server.listen(PORT, () => {
+    server.listen(PORT, '0.0.0.0', () => {
         console.log(`Server is running on port ${PORT}`);
+        console.log(`  Local:   http://localhost:${PORT}`);
+        console.log(`  Network: http://192.168.1.184:${PORT}`);
         console.log('  MongoDB: 20 collection (nhân sự, tài sản, chat, kanban, lịch, CRM)');
         console.log(`  Upload: tối đa ${MAX_UPLOAD_MB}MB/tệp -> ${uploadDir} (cần đăng nhập)`);
         console.log(hasFrontend

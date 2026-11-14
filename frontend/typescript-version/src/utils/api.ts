@@ -11,10 +11,28 @@
  */
 /**
  * Chuỗi rỗng = CÙNG ORIGIN: dùng khi backend phục vụ luôn frontend đã build
- * (một cổng duy nhất, cần cho ngrok). Phải dùng `??` chứ không phải `||`, vì
- * `||` coi chuỗi rỗng là thiếu giá trị và rơi về localhost:5000.
+ * (một cổng duy nhất, cần cho ngrok).
+ *
+ * Tự động nhận diện hostname từ trình duyệt (localhost, 192.168.x.x, 10.x.x.x...)
+ * để các thiết bị khác trong cùng mạng LAN / VLAN truy cập được backend mà không cần cấu hình thủ công.
  */
-export const API_BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:5000'
+const resolveApiBase = (): string => {
+  // 1. Ưu tiên VITE_API_URL nếu được cấu hình rõ ràng trong .env
+  if (import.meta.env.VITE_API_URL !== undefined) {
+    return import.meta.env.VITE_API_URL
+  }
+
+  // 2. Nhận diện dynamic hostname từ trình duyệt khi truy cập qua mạng LAN/VLAN
+  if (typeof window !== 'undefined' && window.location?.hostname) {
+    const proto = window.location.protocol || 'http:'
+    const host = window.location.hostname
+    return `${proto}//${host}:5000`
+  }
+
+  return 'http://192.168.1.184:5000'
+}
+
+export const API_BASE = resolveApiBase()
 
 /** Nối đường dẫn vào gốc API. Truyền path bắt đầu bằng '/'. */
 export const apiUrl = (path: string) => `${API_BASE}${path}`
